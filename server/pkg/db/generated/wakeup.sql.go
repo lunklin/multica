@@ -258,6 +258,29 @@ func (q *Queries) CountRecentWakeupTasks(ctx context.Context, arg CountRecentWak
 	return count, err
 }
 
+const countReservedWakeupFirings = `-- name: CountReservedWakeupFirings :one
+SELECT count(DISTINCT r.task_id)::int FROM issue_wakeup_receipt r
+JOIN agent_task_queue t ON t.id=r.task_id
+WHERE r.wakeup_id= $1 AND r.revision= $2 AND r.processed_at IS NULL
+ AND r.task_id<> $3
+ AND (t.started_at IS NOT NULL OR t.status NOT IN ('completed','failed','cancelled'))
+`
+
+type CountReservedWakeupFiringsParams struct {
+	WakeupID pgtype.UUID `json:"wakeup_id"`
+	Revision int64       `json:"revision"`
+	TaskID   pgtype.UUID `json:"task_id"`
+}
+
+// A claim reserves one firing per run, regardless of its receipt count.
+// Unlike the bounded evidence batch, capacity must consider every reservation.
+func (q *Queries) CountReservedWakeupFirings(ctx context.Context, arg CountReservedWakeupFiringsParams) (int32, error) {
+	row := q.db.QueryRow(ctx, countReservedWakeupFirings, arg.WakeupID, arg.Revision, arg.TaskID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countWakeupFires = `-- name: CountWakeupFires :exec
 UPDATE issue_wakeup SET fire_count=fire_count+1 WHERE id= $1
 `
@@ -1842,7 +1865,7 @@ func (q *Queries) ReplaceWakeupEvidence(ctx context.Context, arg ReplaceWakeupEv
 }
 
 const reserveWakeupReceipts = `-- name: ReserveWakeupReceipts :exec
-UPDATE issue_wakeup_receipt SET task_id= $1 WHERE id=ANY($2::uuid[]) AND processed_at IS NULL
+UPDATE issue_wakeup_receipt SET task_id= $1,coalesce_key=NULL WHERE id=ANY($2::uuid[]) AND processed_at IS NULL
 `
 
 type ReserveWakeupReceiptsParams struct {
@@ -1852,6 +1875,8 @@ type ReserveWakeupReceiptsParams struct {
 
 // A run being claimed takes these inputs along. They stay pending: they count
 // as handled once that run starts, and go back to the rule if it never does.
+// Freeze the delivered evidence: a later source event must get its own pending
+// slot rather than replace a payload the claimed run has already received.
 func (q *Queries) ReserveWakeupReceipts(ctx context.Context, arg ReserveWakeupReceiptsParams) error {
 	_, err := q.db.Exec(ctx, reserveWakeupReceipts, arg.TaskID, arg.Ids)
 	return err

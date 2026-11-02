@@ -305,10 +305,21 @@ SELECT * FROM issue_wakeup WHERE id= @id FOR UPDATE SKIP LOCKED;
 -- name: ReserveWakeupReceipts :exec
 -- A run being claimed takes these inputs along. They stay pending: they count
 -- as handled once that run starts, and go back to the rule if it never does.
-UPDATE issue_wakeup_receipt SET task_id= @task_id WHERE id=ANY(@ids::uuid[]) AND processed_at IS NULL;
+-- Freeze the delivered evidence: a later source event must get its own pending
+-- slot rather than replace a payload the claimed run has already received.
+UPDATE issue_wakeup_receipt SET task_id= @task_id,coalesce_key=NULL WHERE id=ANY(@ids::uuid[]) AND processed_at IS NULL;
 
 -- name: ReleaseWakeupReceipts :exec
 UPDATE issue_wakeup_receipt SET task_id=NULL WHERE id=ANY(@ids::uuid[]) AND processed_at IS NULL;
+
+-- name: CountReservedWakeupFirings :one
+-- A claim reserves one firing per run, regardless of its receipt count.
+-- Unlike the bounded evidence batch, capacity must consider every reservation.
+SELECT count(DISTINCT r.task_id)::int FROM issue_wakeup_receipt r
+JOIN agent_task_queue t ON t.id=r.task_id
+WHERE r.wakeup_id= @wakeup_id AND r.revision= @revision AND r.processed_at IS NULL
+ AND r.task_id<> @task_id
+ AND (t.started_at IS NOT NULL OR t.status NOT IN ('completed','failed','cancelled'));
 
 -- name: SetClaimedTaskContext :one
 -- Only the claim being answered may change its task's context.
