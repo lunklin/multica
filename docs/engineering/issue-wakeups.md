@@ -332,7 +332,7 @@ concurrent creation on different issues. Capacity errors return HTTP 400 with
 `wakeup_capacity_exceeded`. These initial limits bound synchronous source-event
 fanout and can be revisited with measured workload data.
 
-New event captures retain at most one pending notification per rule revision
+New event captures retain at most one unreserved pending notification per rule revision
 and event type (25 currently supported types). Repeated inputs retain a count,
 first occurrence time and the latest source reference, with an explicit prompt
 instruction to read source state. This is a wakeup notification, not an immutable
@@ -541,7 +541,9 @@ checks two things before it creates a run:
   checks that the rule is on, has no run of its own, targets this agent, runs
   as this run's originator, the creator may still use the agent, the inputs
   are not the agent's own and do not close a loop. It then reserves the inputs
-  for the run (`issue_wakeup_receipt.task_id`, still unprocessed), adds the
+  for the run (`issue_wakeup_receipt.task_id`, still unprocessed), clears their
+  coalescing keys so later events cannot replace evidence already delivered,
+  adds the
   rule's chain to the run's `wakeup_chain` and appends `{wakeup_id,
   wakeup_revision, note}` to the run's `context.wakeup_joined`. The claim
   response carries the notes as `wakeup_joined`; the daemon renders them as a
@@ -557,6 +559,11 @@ checks two things before it creates a run:
   reserved ones included. A later claim of the same run (after a claim that
   did not go through) checks every entry again and drops the ones whose rule
   no longer has inputs reserved for it or may no longer reach the run.
+  Outstanding reservations also occupy a firing slot before settlement, so a
+  second short run cannot exceed `max_fires` or repeat a one-shot between
+  scheduler ticks. Multiple receipts reserved for one run occupy one slot;
+  a run that ended without starting releases its slot. A repeated claim of
+  the same run keeps its reservation.
 
 Nothing is consumed before the run starts, so a rule never loses inputs to a
 run that does not run them: if the waiting run is cancelled, fails before

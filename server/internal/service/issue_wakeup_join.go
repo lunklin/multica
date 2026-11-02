@@ -326,6 +326,24 @@ func (s *IssueWakeupService) reserveForRun(ctx context.Context, q *db.Queries, i
 	if !ok {
 		return release()
 	}
+	// Joined firings are counted by dispatch only after their run starts.
+	// Reserve their capacity now so another short run cannot exceed the cap
+	// between scheduler ticks. A re-claim of this run keeps its reservation.
+	limit := w.MaxFires
+	if w.Mode == "once" {
+		limit = pgtype.Int4{Int32: 1, Valid: true}
+	}
+	if limit.Valid {
+		reserved, err := q.CountReservedWakeupFirings(ctx, db.CountReservedWakeupFiringsParams{
+			WakeupID: w.ID, Revision: w.Revision, TaskID: task.ID,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if w.FireCount+reserved >= limit.Int32 {
+			return release()
+		}
+	}
 	if self, err := acknowledgedBySelf(ctx, q, w, task.AgentID, issue.ID, receipts); err != nil || self {
 		if err != nil {
 			return nil, nil, err
