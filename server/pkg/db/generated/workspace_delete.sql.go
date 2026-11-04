@@ -72,6 +72,9 @@ func (q *Queries) DeleteTaskTokensByAgent(ctx context.Context, agentID pgtype.UU
 
 const deleteWorkspaceAdministration = `-- name: DeleteWorkspaceAdministration :exec
 WITH
+deleted_project_run_budget AS (
+    DELETE FROM project_run_budget WHERE workspace_id = $1
+),
 deleted_run_budget AS (
     DELETE FROM workspace_run_budget WHERE workspace_run_budget.workspace_id = $1
 ),

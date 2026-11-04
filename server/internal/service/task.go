@@ -27,6 +27,7 @@ import (
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
+	"github.com/multica-ai/multica/server/internal/tasksource"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
@@ -1340,7 +1341,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
 		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
 		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
+		DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, attrDelegatedFrom),
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
 		// Stamp the reviewed head so dedup can distinguish this run's target
@@ -1515,7 +1516,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
 		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
 		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
+		DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, attrDelegatedFrom),
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
 		// Stamp the reviewed head so dedup can distinguish this run's target
@@ -1679,6 +1680,7 @@ func (s *TaskService) enqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, requesterID, agent)
 	taskID := dbid.NewV7()
 	createParams := db.CreateQuickCreateTaskParams{
+		DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, pgtype.UUID{}),
 		ID:                   taskID,
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
@@ -2119,6 +2121,7 @@ func (s *TaskService) enqueueChatTaskTx(
 	}
 
 	task, err := qtx.CreateChatTask(ctx, db.CreateChatTaskParams{
+		DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, pgtype.UUID{}),
 		ID:                   dbid.NewV7(),
 		AgentID:              chatSession.AgentID,
 		RuntimeID:            agent.RuntimeID,
@@ -2431,6 +2434,7 @@ func (s *TaskService) SendDirectChatMessage(
 		out.Queued = queued
 
 		task, err := qtx.CreateChatTask(ctx, db.CreateChatTaskParams{
+			DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, pgtype.UUID{}),
 			ID:                   dbid.NewV7(),
 			AgentID:              session.AgentID,
 			RuntimeID:            carrier.RuntimeID,
@@ -6885,7 +6889,7 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			RuntimeMcpOverlay:    overlay.Overlay,
 			RuntimeConnectedApps: overlay.ConnectedApps,
 			OriginatorSource:     pgtype.Text{String: string(source), Valid: true},
-			DelegatedFromTaskID:  target.failed.ID,
+			DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, target.failed.ID),
 			RuleVersionID:        ruleVersionID,
 			TriggerEvidenceKind:  pgtype.Text{String: string(attribution.EvidenceDelegatedFailure), Valid: true},
 			TriggerEvidenceRefID: target.failed.ID,

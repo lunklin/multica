@@ -11,6 +11,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/tasksource"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -67,6 +68,7 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			// to convince a downstream handler that its request came
 			// from a non-task-token path.
 			r.Header.Del("X-Actor-Source")
+			r = r.WithContext(tasksource.WithTaskID(r.Context(), pgtype.UUID{}))
 
 			// Agent identity is server-set for exactly the same reason,
 			// and the rest of the codebase already assumes it (see
@@ -142,6 +144,7 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// this header is allowed to carry — strip anything else a
 				// client tried to send.
 				r.Header.Set("X-Actor-Source", "task_token")
+				r = r.WithContext(tasksource.WithTaskID(r.Context(), tt.TaskID))
 				next.ServeHTTP(w, r)
 				return
 			}

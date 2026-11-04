@@ -12,6 +12,12 @@ import (
 // This is a no-model HTTP state-machine test. Real role outputs and code
 // quality are checked separately in the explicitly authorized live trial.
 func TestBoundedDeliveryHandoffUsesSixAdmissions(t *testing.T) {
+	for _, scope := range []string{"workspace", "project"} {
+		t.Run(scope, func(t *testing.T) { testBoundedDeliveryHandoffUsesSixAdmissions(t, scope) })
+	}
+}
+
+func testBoundedDeliveryHandoffUsesSixAdmissions(t *testing.T, scope string) {
 	seedTestCatalog(t)
 	rt := dbfx.Runtime(t, "Bounded delivery runtime")
 	mika := dbfx.Agent(t, "Bounded Mika", rt)
@@ -48,11 +54,15 @@ func TestBoundedDeliveryHandoffUsesSixAdmissions(t *testing.T) {
 	setProjectWorkflow(t, project, map[string]any{"workflow_id": wf.ID}).Want(http.StatusOK)
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), "DELETE FROM workspace_run_budget WHERE workspace_id=$1", testWorkspaceID)
+		testPool.Exec(context.Background(), "DELETE FROM project_run_budget WHERE project_id=$1", project)
 	})
 	testutilBody := map[string]any{"max_runs": 6, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 0}
-	call := budgetRequest("PUT", testWorkspaceID, testutilBody)
-	// The native API performs the no-active-runs check under its workspace lock.
-	testutil.Call(t, testHandler.ConfigureWorkspaceRunBudget, call).Want(http.StatusOK)
+	// Both policies use the real HTTP handler and its no-active-runs fence.
+	if scope == "workspace" {
+		testutil.Call(t, testHandler.ConfigureWorkspaceRunBudget, budgetRequest("PUT", testWorkspaceID, testutilBody)).Want(http.StatusOK)
+	} else {
+		testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", testWorkspaceID, project, testutilBody)).Want(http.StatusOK)
+	}
 	issue := createIssueForTest(t, map[string]any{"title": "Bounded handoff", "project_id": project, "status": "todo"})
 	steps := []struct{ key, id string }{{"todo", mika}, {"in_progress", engineer}, {"in_review", reviewer}, {rework, engineer}, {"in_review", reviewer}, {delivery, mika}, {human, testUserID}}
 	for n, s := range steps {

@@ -661,6 +661,17 @@ func (h *Handler) DeleteProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to lock project")
 		return
 	}
+	if r.Header.Get("X-Actor-Source") == "task_token" || r.Header.Get("X-Agent-ID") != "" {
+		_, budgetErr := qtx.GetProjectRunBudget(r.Context(), db.GetProjectRunBudgetParams{WorkspaceID: project.WorkspaceID, ProjectID: project.ID})
+		if budgetErr == nil {
+			writeError(w, http.StatusForbidden, "agents may not delete a budgeted project")
+			return
+		}
+		if !errors.Is(budgetErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, "failed to inspect project budget")
+			return
+		}
+	}
 	if err := qtx.ClearChatSessionProjectByProject(r.Context(), db.ClearChatSessionProjectByProjectParams{
 		ProjectID:   project.ID,
 		WorkspaceID: project.WorkspaceID,
