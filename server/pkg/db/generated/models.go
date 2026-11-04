@@ -1797,6 +1797,18 @@ type WorkspaceMcpServer struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type WorkspaceRunBudget struct {
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	MaxRuns      int64              `json:"max_runs"`
+	AdmittedRuns int64              `json:"admitted_runs"`
+	Deadline     pgtype.Timestamptz `json:"deadline"`
+	Paused       bool               `json:"paused"`
+	Revision     int64              `json:"revision"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	LastRefusal  pgtype.Text        `json:"last_refusal"`
+}
+
 type WorkspaceShareLink struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`
