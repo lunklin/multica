@@ -1060,7 +1060,7 @@ func TestCodexResultUsageMapUsesSessionModelForDefaultAgent(t *testing.T) {
 		CacheReadTokens:  1000,
 		CacheWriteTokens: 7,
 	}
-	got := codexResultUsageMap(startTime, taskHome, threadID, false, "", jsonRPCUsage)
+	got, _ := codexResultUsageMap(startTime, time.Now(), taskHome, threadID, false, "", jsonRPCUsage)
 	want := map[string]TokenUsage{"gpt-5.6-sol": jsonRPCUsage}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("usage map = %#v, want session model with unchanged JSON-RPC usage %#v", got, want)
