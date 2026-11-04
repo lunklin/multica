@@ -51,7 +51,14 @@ native task history remain available for recovery.
 One Multica run can contain many model requests. This cap is not a dollar,
 token or model-turn limit. A trial claiming at most six total Agent executions
 must also disable native CLI subagents, verify that control in the actual
-runtime/workdir, and use a per-run timeout. The minimal six-run review/repair
+runtime/workdir, and use a per-run timeout. Native safety reviewers need separate
+accounting: Codex can create internal `subagent.other=guardian` sessions even
+when ordinary `multi_agent` features are disabled. These sessions are not
+Multica queue admissions and their usage may be absent from the parent Run's
+reported totals. Check native session history against the provider ledger
+before claiming an all-native-Agent ceiling or complete cost coverage. Keep
+security approval controls intact; this admission budget does not authorize
+removing them to reduce usage. The minimal six-run review/repair
 trial uses one issue and only native status handoffs:
 
 ```text
