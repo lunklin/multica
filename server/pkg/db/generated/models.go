@@ -1386,16 +1386,18 @@ type ProjectResource struct {
 }
 
 type ProjectRunBudget struct {
-	ProjectID    pgtype.UUID        `json:"project_id"`
-	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
-	MaxRuns      int64              `json:"max_runs"`
-	AdmittedRuns int64              `json:"admitted_runs"`
-	Deadline     pgtype.Timestamptz `json:"deadline"`
-	Paused       bool               `json:"paused"`
-	Revision     int64              `json:"revision"`
-	LastRefusal  pgtype.Text        `json:"last_refusal"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ProjectID     pgtype.UUID        `json:"project_id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	MaxRuns       int64              `json:"max_runs"`
+	AdmittedRuns  int64              `json:"admitted_runs"`
+	Deadline      pgtype.Timestamptz `json:"deadline"`
+	Paused        bool               `json:"paused"`
+	Revision      int64              `json:"revision"`
+	LastRefusal   pgtype.Text        `json:"last_refusal"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	StopOnFailure bool               `json:"stop_on_failure"`
+	FailureTaskID pgtype.UUID        `json:"failure_task_id"`
 }
 
 type QuickAction struct {

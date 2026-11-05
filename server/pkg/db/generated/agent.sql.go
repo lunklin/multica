@@ -1563,6 +1563,7 @@ WHERE id = (
     WHERE atq.agent_id = $2
       AND atq.runtime_id = $3
       AND atq.status = 'queued'
+      AND NOT task_project_failure_blocked(atq.id)
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
       AND EXISTS (
           SELECT 1
@@ -3149,7 +3150,7 @@ func (q *Queries) DeleteUnstartedQuickCreateRetryTask(ctx context.Context, taskI
 }
 
 const expireStaleQueuedTasks = `-- name: ExpireStaleQueuedTasks :many
-WITH victims AS (
+WITH victims AS MATERIALIZED (
     SELECT id FROM agent_task_queue
     WHERE status = 'queued' AND context->>'wakeup_id' IS NULL
       AND created_at < now() - make_interval(secs => $1::double precision)
@@ -3172,15 +3173,20 @@ WITH victims AS (
       )
     ORDER BY created_at ASC
     LIMIT $2::int
-    FOR UPDATE SKIP LOCKED
-)
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), locked_victims AS MATERIALIZED (
+    SELECT task.id FROM agent_task_queue task JOIN victims ON victims.id=task.id
+    WHERE (SELECT locked FROM budget_fence)>=0
+    FOR UPDATE OF task SKIP LOCKED
+), failed AS (
 UPDATE agent_task_queue t
 SET status = 'failed',
     completed_at = now(),
     error = 'runtime unavailable while task was queued',
     failure_reason = 'queued_expired',
     prepare_lease_expires_at = NULL
-FROM victims v
+FROM locked_victims v
 WHERE t.id = v.id
   AND t.status = 'queued'
   AND t.created_at < now() - make_interval(secs => $1::double precision)
@@ -3199,12 +3205,81 @@ WHERE t.id = v.id
       WHERE retry_parent.id = t.parent_task_id
         AND retry_parent.failure_reason = 'runtime_offline'
   )
+  AND (SELECT locked FROM budget_fence) >= 0
 RETURNING t.id, t.agent_id, t.issue_id, t.status, t.priority, t.dispatched_at, t.started_at, t.completed_at, t.result, t.error, t.created_at, t.context, t.runtime_id, t.session_id, t.work_dir, t.trigger_comment_id, t.chat_session_id, t.autopilot_run_id, t.attempt, t.max_attempts, t.parent_task_id, t.failure_reason, t.trigger_summary, t.force_fresh_session, t.is_leader_task, t.wait_reason, t.initiator_user_id, t.handoff_note, t.prepare_lease_expires_at, t.squad_id, t.runtime_mcp_overlay, t.escalation_for_task_id, t.fire_at, t.originator_user_id, t.runtime_connected_apps, t.coalesced_comment_ids, t.delivered_comment_ids, t.chat_input_task_id, t.chat_finalize_deferred_at, t.originator_source, t.delegated_from_task_id, t.retry_of_task_id, t.rerun_of_task_id, t.rule_version_id, t.trigger_evidence_kind, t.trigger_evidence_ref_id, t.accountable_user_id, t.session_rollout_missing, t.retired_session_id, t.quick_actions_disabled, t.regenerate_quick_actions_for, t.branch_name, t.durable_work_dir, t.channel_context_revision, t.comment_thread_id, t.cancelled_by_type, t.cancelled_by_id, t.cancelled_by_name, t.issue_snapshot, t.workflow_step, t.budget_project_ids
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.id, failed.agent_id, failed.issue_id, failed.status, failed.priority, failed.dispatched_at, failed.started_at, failed.completed_at, failed.result, failed.error, failed.created_at, failed.context, failed.runtime_id, failed.session_id, failed.work_dir, failed.trigger_comment_id, failed.chat_session_id, failed.autopilot_run_id, failed.attempt, failed.max_attempts, failed.parent_task_id, failed.failure_reason, failed.trigger_summary, failed.force_fresh_session, failed.is_leader_task, failed.wait_reason, failed.initiator_user_id, failed.handoff_note, failed.prepare_lease_expires_at, failed.squad_id, failed.runtime_mcp_overlay, failed.escalation_for_task_id, failed.fire_at, failed.originator_user_id, failed.runtime_connected_apps, failed.coalesced_comment_ids, failed.delivered_comment_ids, failed.chat_input_task_id, failed.chat_finalize_deferred_at, failed.originator_source, failed.delegated_from_task_id, failed.retry_of_task_id, failed.rerun_of_task_id, failed.rule_version_id, failed.trigger_evidence_kind, failed.trigger_evidence_ref_id, failed.accountable_user_id, failed.session_rollout_missing, failed.retired_session_id, failed.quick_actions_disabled, failed.regenerate_quick_actions_for, failed.branch_name, failed.durable_work_dir, failed.channel_context_revision, failed.comment_thread_id, failed.cancelled_by_type, failed.cancelled_by_id, failed.cancelled_by_name, failed.issue_snapshot, failed.workflow_step, failed.budget_project_ids FROM failed WHERE (SELECT changed FROM latch) >= 0
 `
 
 type ExpireStaleQueuedTasksParams struct {
 	ReconnectGraceSecs float64 `json:"reconnect_grace_secs"`
 	MaxPerTick         int32   `json:"max_per_tick"`
+}
+
+type ExpireStaleQueuedTasksRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	BranchName                pgtype.Text        `json:"branch_name"`
+	DurableWorkDir            pgtype.Text        `json:"durable_work_dir"`
+	ChannelContextRevision    pgtype.Int8        `json:"channel_context_revision"`
+	CommentThreadID           pgtype.UUID        `json:"comment_thread_id"`
+	CancelledByType           pgtype.Text        `json:"cancelled_by_type"`
+	CancelledByID             pgtype.UUID        `json:"cancelled_by_id"`
+	CancelledByName           pgtype.Text        `json:"cancelled_by_name"`
+	IssueSnapshot             []byte             `json:"issue_snapshot"`
+	WorkflowStep              pgtype.Text        `json:"workflow_step"`
+	BudgetProjectIds          []pgtype.UUID      `json:"budget_project_ids"`
 }
 
 // Expire queued work only when both the task's waiting age and the runtime's
@@ -3215,15 +3290,15 @@ type ExpireStaleQueuedTasksParams struct {
 // runtime_offline retries have a separate reconnect expiry policy and are exempt.
 // Select bounded victims with SKIP LOCKED, then re-check status and liveness in
 // the update so concurrent claims cannot be overwritten.
-func (q *Queries) ExpireStaleQueuedTasks(ctx context.Context, arg ExpireStaleQueuedTasksParams) ([]AgentTaskQueue, error) {
+func (q *Queries) ExpireStaleQueuedTasks(ctx context.Context, arg ExpireStaleQueuedTasksParams) ([]ExpireStaleQueuedTasksRow, error) {
 	rows, err := q.db.Query(ctx, expireStaleQueuedTasks, arg.ReconnectGraceSecs, arg.MaxPerTick)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []AgentTaskQueue{}
+	items := []ExpireStaleQueuedTasksRow{}
 	for rows.Next() {
-		var i AgentTaskQueue
+		var i ExpireStaleQueuedTasksRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.AgentID,
@@ -3387,7 +3462,13 @@ func (q *Queries) ExtendAgentTaskPrepareLease(ctx context.Context, arg ExtendAge
 }
 
 const failAgentTask = `-- name: FailAgentTask :one
-UPDATE agent_task_queue
+WITH victims AS MATERIALIZED (
+    SELECT candidate.id FROM agent_task_queue candidate
+    WHERE candidate.id = $1 AND candidate.status IN ('dispatched', 'running', 'waiting_local_directory')
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     completed_at = now(),
     error = $2,
@@ -3399,8 +3480,14 @@ SET status = 'failed',
     session_rollout_missing = $4,
     retired_session_id = COALESCE($9, retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step, budget_project_ids
+WHERE (task.id = $1 AND task.status IN ('dispatched', 'running', 'waiting_local_directory'))
+  AND task.id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.branch_name, task.durable_work_dir, task.channel_context_revision, task.comment_thread_id, task.cancelled_by_type, task.cancelled_by_id, task.cancelled_by_name, task.issue_snapshot, task.workflow_step, task.budget_project_ids
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.id, failed.agent_id, failed.issue_id, failed.status, failed.priority, failed.dispatched_at, failed.started_at, failed.completed_at, failed.result, failed.error, failed.created_at, failed.context, failed.runtime_id, failed.session_id, failed.work_dir, failed.trigger_comment_id, failed.chat_session_id, failed.autopilot_run_id, failed.attempt, failed.max_attempts, failed.parent_task_id, failed.failure_reason, failed.trigger_summary, failed.force_fresh_session, failed.is_leader_task, failed.wait_reason, failed.initiator_user_id, failed.handoff_note, failed.prepare_lease_expires_at, failed.squad_id, failed.runtime_mcp_overlay, failed.escalation_for_task_id, failed.fire_at, failed.originator_user_id, failed.runtime_connected_apps, failed.coalesced_comment_ids, failed.delivered_comment_ids, failed.chat_input_task_id, failed.chat_finalize_deferred_at, failed.originator_source, failed.delegated_from_task_id, failed.retry_of_task_id, failed.rerun_of_task_id, failed.rule_version_id, failed.trigger_evidence_kind, failed.trigger_evidence_ref_id, failed.accountable_user_id, failed.session_rollout_missing, failed.retired_session_id, failed.quick_actions_disabled, failed.regenerate_quick_actions_for, failed.branch_name, failed.durable_work_dir, failed.channel_context_revision, failed.comment_thread_id, failed.cancelled_by_type, failed.cancelled_by_id, failed.cancelled_by_name, failed.issue_snapshot, failed.workflow_step, failed.budget_project_ids FROM failed WHERE (SELECT changed FROM latch) >= 0
 `
 
 type FailAgentTaskParams struct {
@@ -3413,6 +3500,70 @@ type FailAgentTaskParams struct {
 	DurableWorkDir        pgtype.Text `json:"durable_work_dir"`
 	BranchName            pgtype.Text `json:"branch_name"`
 	RetiredSessionID      pgtype.Text `json:"retired_session_id"`
+}
+
+type FailAgentTaskRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	BranchName                pgtype.Text        `json:"branch_name"`
+	DurableWorkDir            pgtype.Text        `json:"durable_work_dir"`
+	ChannelContextRevision    pgtype.Int8        `json:"channel_context_revision"`
+	CommentThreadID           pgtype.UUID        `json:"comment_thread_id"`
+	CancelledByType           pgtype.Text        `json:"cancelled_by_type"`
+	CancelledByID             pgtype.UUID        `json:"cancelled_by_id"`
+	CancelledByName           pgtype.Text        `json:"cancelled_by_name"`
+	IssueSnapshot             []byte             `json:"issue_snapshot"`
+	WorkflowStep              pgtype.Text        `json:"workflow_step"`
+	BudgetProjectIds          []pgtype.UUID      `json:"budget_project_ids"`
 }
 
 // Marks a task as failed. session_id and work_dir are merged via COALESCE so
@@ -3430,7 +3581,7 @@ type FailAgentTaskParams struct {
 // the COALESCE that would otherwise preserve a stale mid-flight pin — and flag
 // the row, in the SAME transaction that creates and wakes the auto-retry, so the
 // retry can never claim the bad pointer or miss the continuity gap.
-func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (AgentTaskQueue, error) {
+func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (FailAgentTaskRow, error) {
 	row := q.db.QueryRow(ctx, failAgentTask,
 		arg.ID,
 		arg.Error,
@@ -3442,7 +3593,7 @@ func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (A
 		arg.BranchName,
 		arg.RetiredSessionID,
 	)
-	var i AgentTaskQueue
+	var i FailAgentTaskRow
 	err := row.Scan(
 		&i.ID,
 		&i.AgentID,
@@ -3510,7 +3661,7 @@ func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (A
 }
 
 const failExpiredRuntimeReconnectRetries = `-- name: FailExpiredRuntimeReconnectRetries :many
-WITH victims AS (
+WITH victims AS MATERIALIZED (
     SELECT retry.id
     FROM agent_task_queue retry
     JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
@@ -3526,8 +3677,13 @@ WITH victims AS (
       )
     ORDER BY retry.fire_at, retry.created_at
     LIMIT $3::int
-    FOR UPDATE OF retry SKIP LOCKED
-)
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), locked_victims AS MATERIALIZED (
+    SELECT task.id FROM agent_task_queue task JOIN victims ON victims.id=task.id
+    WHERE (SELECT locked FROM budget_fence)>=0
+    FOR UPDATE OF task SKIP LOCKED
+), failed AS (
 UPDATE agent_task_queue AS retry
 SET status = 'failed',
     completed_at = now(),
@@ -3535,8 +3691,8 @@ SET status = 'failed',
     failure_reason = 'runtime_reconnect_timeout',
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
-FROM victims
-WHERE retry.id = victims.id
+FROM locked_victims
+WHERE retry.id = locked_victims.id
   AND retry.status = 'deferred'
   AND retry.fire_at < now() - make_interval(secs => $1::double precision)
   AND EXISTS (
@@ -3551,13 +3707,82 @@ WHERE retry.id = victims.id
         AND COALESCE(runtime.last_seen_at, runtime.updated_at) >=
             now() - make_interval(secs => $2::double precision)
   )
+  AND (SELECT locked FROM budget_fence) >= 0
 RETURNING retry.id, retry.agent_id, retry.issue_id, retry.status, retry.priority, retry.dispatched_at, retry.started_at, retry.completed_at, retry.result, retry.error, retry.created_at, retry.context, retry.runtime_id, retry.session_id, retry.work_dir, retry.trigger_comment_id, retry.chat_session_id, retry.autopilot_run_id, retry.attempt, retry.max_attempts, retry.parent_task_id, retry.failure_reason, retry.trigger_summary, retry.force_fresh_session, retry.is_leader_task, retry.wait_reason, retry.initiator_user_id, retry.handoff_note, retry.prepare_lease_expires_at, retry.squad_id, retry.runtime_mcp_overlay, retry.escalation_for_task_id, retry.fire_at, retry.originator_user_id, retry.runtime_connected_apps, retry.coalesced_comment_ids, retry.delivered_comment_ids, retry.chat_input_task_id, retry.chat_finalize_deferred_at, retry.originator_source, retry.delegated_from_task_id, retry.retry_of_task_id, retry.rerun_of_task_id, retry.rule_version_id, retry.trigger_evidence_kind, retry.trigger_evidence_ref_id, retry.accountable_user_id, retry.session_rollout_missing, retry.retired_session_id, retry.quick_actions_disabled, retry.regenerate_quick_actions_for, retry.branch_name, retry.durable_work_dir, retry.channel_context_revision, retry.comment_thread_id, retry.cancelled_by_type, retry.cancelled_by_id, retry.cancelled_by_name, retry.issue_snapshot, retry.workflow_step, retry.budget_project_ids
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.id, failed.agent_id, failed.issue_id, failed.status, failed.priority, failed.dispatched_at, failed.started_at, failed.completed_at, failed.result, failed.error, failed.created_at, failed.context, failed.runtime_id, failed.session_id, failed.work_dir, failed.trigger_comment_id, failed.chat_session_id, failed.autopilot_run_id, failed.attempt, failed.max_attempts, failed.parent_task_id, failed.failure_reason, failed.trigger_summary, failed.force_fresh_session, failed.is_leader_task, failed.wait_reason, failed.initiator_user_id, failed.handoff_note, failed.prepare_lease_expires_at, failed.squad_id, failed.runtime_mcp_overlay, failed.escalation_for_task_id, failed.fire_at, failed.originator_user_id, failed.runtime_connected_apps, failed.coalesced_comment_ids, failed.delivered_comment_ids, failed.chat_input_task_id, failed.chat_finalize_deferred_at, failed.originator_source, failed.delegated_from_task_id, failed.retry_of_task_id, failed.rerun_of_task_id, failed.rule_version_id, failed.trigger_evidence_kind, failed.trigger_evidence_ref_id, failed.accountable_user_id, failed.session_rollout_missing, failed.retired_session_id, failed.quick_actions_disabled, failed.regenerate_quick_actions_for, failed.branch_name, failed.durable_work_dir, failed.channel_context_revision, failed.comment_thread_id, failed.cancelled_by_type, failed.cancelled_by_id, failed.cancelled_by_name, failed.issue_snapshot, failed.workflow_step, failed.budget_project_ids FROM failed WHERE (SELECT changed FROM latch) >= 0
 `
 
 type FailExpiredRuntimeReconnectRetriesParams struct {
 	ReconnectGraceSecs float64 `json:"reconnect_grace_secs"`
 	RuntimeStaleSecs   float64 `json:"runtime_stale_secs"`
 	MaxPerTick         int32   `json:"max_per_tick"`
+}
+
+type FailExpiredRuntimeReconnectRetriesRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	BranchName                pgtype.Text        `json:"branch_name"`
+	DurableWorkDir            pgtype.Text        `json:"durable_work_dir"`
+	ChannelContextRevision    pgtype.Int8        `json:"channel_context_revision"`
+	CommentThreadID           pgtype.UUID        `json:"comment_thread_id"`
+	CancelledByType           pgtype.Text        `json:"cancelled_by_type"`
+	CancelledByID             pgtype.UUID        `json:"cancelled_by_id"`
+	CancelledByName           pgtype.Text        `json:"cancelled_by_name"`
+	IssueSnapshot             []byte             `json:"issue_snapshot"`
+	WorkflowStep              pgtype.Text        `json:"workflow_step"`
+	BudgetProjectIds          []pgtype.UUID      `json:"budget_project_ids"`
 }
 
 // A runtime_offline retry waits in deferred until its runtime returns healthy.
@@ -3567,15 +3792,15 @@ type FailExpiredRuntimeReconnectRetriesParams struct {
 // remains deferred for the next daemon poll to promote. The parent join is the
 // lineage discriminator; provider backoff and other deferred task types are
 // intentionally excluded.
-func (q *Queries) FailExpiredRuntimeReconnectRetries(ctx context.Context, arg FailExpiredRuntimeReconnectRetriesParams) ([]AgentTaskQueue, error) {
+func (q *Queries) FailExpiredRuntimeReconnectRetries(ctx context.Context, arg FailExpiredRuntimeReconnectRetriesParams) ([]FailExpiredRuntimeReconnectRetriesRow, error) {
 	rows, err := q.db.Query(ctx, failExpiredRuntimeReconnectRetries, arg.ReconnectGraceSecs, arg.RuntimeStaleSecs, arg.MaxPerTick)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []AgentTaskQueue{}
+	items := []FailExpiredRuntimeReconnectRetriesRow{}
 	for rows.Next() {
-		var i AgentTaskQueue
+		var i FailExpiredRuntimeReconnectRetriesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.AgentID,
@@ -3650,11 +3875,9 @@ func (q *Queries) FailExpiredRuntimeReconnectRetries(ctx context.Context, arg Fa
 }
 
 const failStaleTasks = `-- name: FailStaleTasks :many
-UPDATE agent_task_queue
-SET status = 'failed', completed_at = now(), error = 'task timed out',
-    failure_reason = 'timeout',
-    prepare_lease_expires_at = NULL
-WHERE (
+WITH victims AS MATERIALIZED (
+    SELECT id FROM agent_task_queue
+    WHERE (
     status = 'dispatched'
     AND dispatched_at < now() - make_interval(secs => $1::double precision)
     AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
@@ -3692,7 +3915,58 @@ WHERE (
       )
     )
   )
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue
+SET status = 'failed', completed_at = now(), error = 'task timed out',
+    failure_reason = 'timeout',
+    prepare_lease_expires_at = NULL
+WHERE ((
+    status = 'dispatched'
+    AND dispatched_at < now() - make_interval(secs => $1::double precision)
+    AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
+    AND (
+      runtime_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+          AND (
+            (
+              r.status = 'online'
+              AND COALESCE(r.last_seen_at, r.updated_at) >=
+                  now() - make_interval(secs => $2::double precision)
+            )
+            OR COALESCE(r.last_seen_at, r.updated_at) <
+               now() - make_interval(secs => $3::double precision)
+          )
+      )
+    )
+  )
+   OR (
+    status = 'running'
+    AND started_at < now() - make_interval(secs => $4::double precision)
+    AND (
+      runtime_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+          AND COALESCE(r.last_seen_at, r.updated_at) >=
+              now() - make_interval(secs => $3::double precision)
+      )
+    )
+  ))
+  AND id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step, budget_project_ids
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.id, failed.agent_id, failed.issue_id, failed.status, failed.priority, failed.dispatched_at, failed.started_at, failed.completed_at, failed.result, failed.error, failed.created_at, failed.context, failed.runtime_id, failed.session_id, failed.work_dir, failed.trigger_comment_id, failed.chat_session_id, failed.autopilot_run_id, failed.attempt, failed.max_attempts, failed.parent_task_id, failed.failure_reason, failed.trigger_summary, failed.force_fresh_session, failed.is_leader_task, failed.wait_reason, failed.initiator_user_id, failed.handoff_note, failed.prepare_lease_expires_at, failed.squad_id, failed.runtime_mcp_overlay, failed.escalation_for_task_id, failed.fire_at, failed.originator_user_id, failed.runtime_connected_apps, failed.coalesced_comment_ids, failed.delivered_comment_ids, failed.chat_input_task_id, failed.chat_finalize_deferred_at, failed.originator_source, failed.delegated_from_task_id, failed.retry_of_task_id, failed.rerun_of_task_id, failed.rule_version_id, failed.trigger_evidence_kind, failed.trigger_evidence_ref_id, failed.accountable_user_id, failed.session_rollout_missing, failed.retired_session_id, failed.quick_actions_disabled, failed.regenerate_quick_actions_for, failed.branch_name, failed.durable_work_dir, failed.channel_context_revision, failed.comment_thread_id, failed.cancelled_by_type, failed.cancelled_by_id, failed.cancelled_by_name, failed.issue_snapshot, failed.workflow_step, failed.budget_project_ids FROM failed WHERE (SELECT changed FROM latch) >= 0
 `
 
 type FailStaleTasksParams struct {
@@ -3700,6 +3974,70 @@ type FailStaleTasksParams struct {
 	RuntimeStaleSecs          float64 `json:"runtime_stale_secs"`
 	RuntimeReconnectGraceSecs float64 `json:"runtime_reconnect_grace_secs"`
 	RunningTimeoutSecs        float64 `json:"running_timeout_secs"`
+}
+
+type FailStaleTasksRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	BranchName                pgtype.Text        `json:"branch_name"`
+	DurableWorkDir            pgtype.Text        `json:"durable_work_dir"`
+	ChannelContextRevision    pgtype.Int8        `json:"channel_context_revision"`
+	CommentThreadID           pgtype.UUID        `json:"comment_thread_id"`
+	CancelledByType           pgtype.Text        `json:"cancelled_by_type"`
+	CancelledByID             pgtype.UUID        `json:"cancelled_by_id"`
+	CancelledByName           pgtype.Text        `json:"cancelled_by_name"`
+	IssueSnapshot             []byte             `json:"issue_snapshot"`
+	WorkflowStep              pgtype.Text        `json:"workflow_step"`
+	BudgetProjectIds          []pgtype.UUID      `json:"budget_project_ids"`
 }
 
 // Fails tasks stuck in dispatched/running beyond the given thresholds.
@@ -3734,7 +4072,7 @@ type FailStaleTasksParams struct {
 // of this task can exceed the dispatch / running timeouts without being
 // "stuck". If the daemon dies, RecoverOrphanedTasksForRuntime reclaims
 // those rows at restart.
-func (q *Queries) FailStaleTasks(ctx context.Context, arg FailStaleTasksParams) ([]AgentTaskQueue, error) {
+func (q *Queries) FailStaleTasks(ctx context.Context, arg FailStaleTasksParams) ([]FailStaleTasksRow, error) {
 	rows, err := q.db.Query(ctx, failStaleTasks,
 		arg.DispatchTimeoutSecs,
 		arg.RuntimeStaleSecs,
@@ -3745,9 +4083,9 @@ func (q *Queries) FailStaleTasks(ctx context.Context, arg FailStaleTasksParams) 
 		return nil, err
 	}
 	defer rows.Close()
-	items := []AgentTaskQueue{}
+	items := []FailStaleTasksRow{}
 	for rows.Next() {
-		var i AgentTaskQueue
+		var i FailStaleTasksRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.AgentID,
@@ -6090,6 +6428,7 @@ const listQueuedClaimCandidatesByRuntime = `-- name: ListQueuedClaimCandidatesBy
 SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id, atq.chat_session_id, atq.autopilot_run_id, atq.attempt, atq.max_attempts, atq.parent_task_id, atq.failure_reason, atq.trigger_summary, atq.force_fresh_session, atq.is_leader_task, atq.wait_reason, atq.initiator_user_id, atq.handoff_note, atq.prepare_lease_expires_at, atq.squad_id, atq.runtime_mcp_overlay, atq.escalation_for_task_id, atq.fire_at, atq.originator_user_id, atq.runtime_connected_apps, atq.coalesced_comment_ids, atq.delivered_comment_ids, atq.chat_input_task_id, atq.chat_finalize_deferred_at, atq.originator_source, atq.delegated_from_task_id, atq.retry_of_task_id, atq.rerun_of_task_id, atq.rule_version_id, atq.trigger_evidence_kind, atq.trigger_evidence_ref_id, atq.accountable_user_id, atq.session_rollout_missing, atq.retired_session_id, atq.quick_actions_disabled, atq.regenerate_quick_actions_for, atq.branch_name, atq.durable_work_dir, atq.channel_context_revision, atq.comment_thread_id, atq.cancelled_by_type, atq.cancelled_by_id, atq.cancelled_by_name, atq.issue_snapshot, atq.workflow_step, atq.budget_project_ids FROM agent_task_queue atq
 WHERE atq.runtime_id = $1
   AND atq.status = 'queued'
+      AND NOT task_project_failure_blocked(atq.id)
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
@@ -6200,6 +6539,7 @@ const listQueuedClaimCandidatesByRuntimes = `-- name: ListQueuedClaimCandidatesB
 SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id, atq.chat_session_id, atq.autopilot_run_id, atq.attempt, atq.max_attempts, atq.parent_task_id, atq.failure_reason, atq.trigger_summary, atq.force_fresh_session, atq.is_leader_task, atq.wait_reason, atq.initiator_user_id, atq.handoff_note, atq.prepare_lease_expires_at, atq.squad_id, atq.runtime_mcp_overlay, atq.escalation_for_task_id, atq.fire_at, atq.originator_user_id, atq.runtime_connected_apps, atq.coalesced_comment_ids, atq.delivered_comment_ids, atq.chat_input_task_id, atq.chat_finalize_deferred_at, atq.originator_source, atq.delegated_from_task_id, atq.retry_of_task_id, atq.rerun_of_task_id, atq.rule_version_id, atq.trigger_evidence_kind, atq.trigger_evidence_ref_id, atq.accountable_user_id, atq.session_rollout_missing, atq.retired_session_id, atq.quick_actions_disabled, atq.regenerate_quick_actions_for, atq.branch_name, atq.durable_work_dir, atq.channel_context_revision, atq.comment_thread_id, atq.cancelled_by_type, atq.cancelled_by_id, atq.cancelled_by_name, atq.issue_snapshot, atq.workflow_step, atq.budget_project_ids FROM agent_task_queue atq
 WHERE atq.runtime_id = ANY($1::uuid[])
   AND atq.status = 'queued'
+      AND NOT task_project_failure_blocked(atq.id)
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
@@ -6853,9 +7193,17 @@ func (q *Queries) LockAgentForAutopilotAssignment(ctx context.Context, arg LockA
 }
 
 const lockAgentTaskStartClaim = `-- name: LockAgentTaskStartClaim :one
+WITH budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY[$1::uuid]) AS locked
+), budget_gate AS MATERIALIZED (
+    SELECT NOT task_project_failure_blocked($1::uuid) AS allowed
+    FROM budget_fence WHERE locked>=0
+)
 SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step, budget_project_ids FROM agent_task_queue
 WHERE id = $1 AND runtime_id = $2 AND dispatched_at = $3
   AND status IN ('dispatched', 'waiting_local_directory', 'running')
+  AND (SELECT count(*) FROM budget_gate)>=0
+  AND (status='running' OR (SELECT allowed FROM budget_gate))
 FOR UPDATE
 `
 
@@ -7831,6 +8179,7 @@ WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
       AND atq.status = 'dispatched'
+      AND NOT task_project_failure_blocked(atq.id)
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
@@ -7956,6 +8305,7 @@ WITH candidates AS MATERIALIZED (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = ANY($2::uuid[])
       AND atq.status = 'dispatched'
+      AND NOT task_project_failure_blocked(atq.id)
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
@@ -8100,16 +8450,92 @@ func (q *Queries) ReclaimStaleDispatchedTasksForRuntimes(ctx context.Context, ar
 }
 
 const recoverOrphanedTasksForRuntime = `-- name: RecoverOrphanedTasksForRuntime :many
-UPDATE agent_task_queue
+WITH victims AS MATERIALIZED (
+    SELECT candidate.id FROM agent_task_queue candidate
+    WHERE candidate.runtime_id = $1 AND candidate.status IN ('dispatched', 'running', 'waiting_local_directory')
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     completed_at = now(),
     error = 'daemon restarted while task was in flight',
     failure_reason = 'runtime_recovery',
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
-WHERE runtime_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step, budget_project_ids
+WHERE (task.runtime_id = $1 AND task.status IN ('dispatched', 'running', 'waiting_local_directory'))
+  AND task.id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.branch_name, task.durable_work_dir, task.channel_context_revision, task.comment_thread_id, task.cancelled_by_type, task.cancelled_by_id, task.cancelled_by_name, task.issue_snapshot, task.workflow_step, task.budget_project_ids
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.id, failed.agent_id, failed.issue_id, failed.status, failed.priority, failed.dispatched_at, failed.started_at, failed.completed_at, failed.result, failed.error, failed.created_at, failed.context, failed.runtime_id, failed.session_id, failed.work_dir, failed.trigger_comment_id, failed.chat_session_id, failed.autopilot_run_id, failed.attempt, failed.max_attempts, failed.parent_task_id, failed.failure_reason, failed.trigger_summary, failed.force_fresh_session, failed.is_leader_task, failed.wait_reason, failed.initiator_user_id, failed.handoff_note, failed.prepare_lease_expires_at, failed.squad_id, failed.runtime_mcp_overlay, failed.escalation_for_task_id, failed.fire_at, failed.originator_user_id, failed.runtime_connected_apps, failed.coalesced_comment_ids, failed.delivered_comment_ids, failed.chat_input_task_id, failed.chat_finalize_deferred_at, failed.originator_source, failed.delegated_from_task_id, failed.retry_of_task_id, failed.rerun_of_task_id, failed.rule_version_id, failed.trigger_evidence_kind, failed.trigger_evidence_ref_id, failed.accountable_user_id, failed.session_rollout_missing, failed.retired_session_id, failed.quick_actions_disabled, failed.regenerate_quick_actions_for, failed.branch_name, failed.durable_work_dir, failed.channel_context_revision, failed.comment_thread_id, failed.cancelled_by_type, failed.cancelled_by_id, failed.cancelled_by_name, failed.issue_snapshot, failed.workflow_step, failed.budget_project_ids FROM failed WHERE (SELECT changed FROM latch) >= 0
 `
+
+type RecoverOrphanedTasksForRuntimeRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	BranchName                pgtype.Text        `json:"branch_name"`
+	DurableWorkDir            pgtype.Text        `json:"durable_work_dir"`
+	ChannelContextRevision    pgtype.Int8        `json:"channel_context_revision"`
+	CommentThreadID           pgtype.UUID        `json:"comment_thread_id"`
+	CancelledByType           pgtype.Text        `json:"cancelled_by_type"`
+	CancelledByID             pgtype.UUID        `json:"cancelled_by_id"`
+	CancelledByName           pgtype.Text        `json:"cancelled_by_name"`
+	IssueSnapshot             []byte             `json:"issue_snapshot"`
+	WorkflowStep              pgtype.Text        `json:"workflow_step"`
+	BudgetProjectIds          []pgtype.UUID      `json:"budget_project_ids"`
+}
 
 // Called by the daemon at startup. Atomically fails any dispatched/running/
 // waiting_local_directory task that the prior incarnation of this runtime
@@ -8117,15 +8543,15 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 // them to the auto-retry path. waiting_local_directory rows are included
 // because the daemon holding the path lock is the same process that just
 // died — without us, the row would sit waiting forever.
-func (q *Queries) RecoverOrphanedTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]AgentTaskQueue, error) {
+func (q *Queries) RecoverOrphanedTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]RecoverOrphanedTasksForRuntimeRow, error) {
 	rows, err := q.db.Query(ctx, recoverOrphanedTasksForRuntime, runtimeID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []AgentTaskQueue{}
+	items := []RecoverOrphanedTasksForRuntimeRow{}
 	for rows.Next() {
-		var i AgentTaskQueue
+		var i RecoverOrphanedTasksForRuntimeRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.AgentID,

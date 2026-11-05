@@ -17,7 +17,8 @@ func newProjectRunBudgetCommand() *cobra.Command {
 	set.Flags().Int64("max-runs", 0, "Total admissions since this budget was armed (including failed/cancelled/retry runs)")
 	set.Flags().String("deadline", "", "Future admission deadline (RFC3339)")
 	set.Flags().Int64("expected-revision", 0, "Observed revision; 0 arms a new budget")
-	set.Flags().Bool("paused", false, "Pause new admissions; does not cancel existing work")
+	set.Flags().Bool("paused", false, "Pause admissions; explicit --paused=false acknowledges a failure stop without resetting usage")
+	set.Flags().Bool("stop-on-failure", false, "Pause this project after an actual Run failure; omit to preserve the policy")
 	for _, flag := range []string{"max-runs", "deadline", "expected-revision"} {
 		_ = set.MarkFlagRequired(flag)
 	}
@@ -71,7 +72,15 @@ func runProjectBudgetSet(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 	var result map[string]any
-	if err := c.PutJSON(ctx, path, map[string]any{"max_runs": maxRuns, "expected_revision": revision, "deadline": deadline, "paused": paused}, &result); err != nil {
+	body := map[string]any{"max_runs": maxRuns, "expected_revision": revision, "deadline": deadline}
+	if cmd.Flags().Changed("paused") {
+		body["paused"] = paused
+	}
+	if cmd.Flags().Changed("stop-on-failure") {
+		stopOnFailure, _ := cmd.Flags().GetBool("stop-on-failure")
+		body["stop_on_failure"] = stopOnFailure
+	}
+	if err := c.PutJSON(ctx, path, body, &result); err != nil {
 		return err
 	}
 	return cli.PrintJSON(os.Stdout, result)

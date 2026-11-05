@@ -24,27 +24,102 @@ func (q *Queries) ClearTaskProcessCleanupPending(ctx context.Context, id pgtype.
 }
 
 const failCancelledTaskProcessCleanup = `-- name: FailCancelledTaskProcessCleanup :one
-UPDATE agent_task_queue
+WITH victims AS MATERIALIZED (
+    SELECT candidate.id FROM agent_task_queue candidate WHERE candidate.id = $1 AND candidate.status='cancelled'
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue AS task
 SET status = 'failed',
-    error = concat_ws('; ', NULLIF(error, ''), $1::text),
+    error = concat_ws('; ', NULLIF(error, ''), $2::text),
     failure_reason = 'cleanup_unconfirmed',
     completed_at = now(),
     chat_finalize_deferred_at = NULL
-WHERE id = $2 AND status = 'cancelled'
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step, budget_project_ids
+WHERE task.id = $1 AND task.status = 'cancelled'
+  AND task.id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.branch_name, task.durable_work_dir, task.channel_context_revision, task.comment_thread_id, task.cancelled_by_type, task.cancelled_by_id, task.cancelled_by_name, task.issue_snapshot, task.workflow_step, task.budget_project_ids
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.id, failed.agent_id, failed.issue_id, failed.status, failed.priority, failed.dispatched_at, failed.started_at, failed.completed_at, failed.result, failed.error, failed.created_at, failed.context, failed.runtime_id, failed.session_id, failed.work_dir, failed.trigger_comment_id, failed.chat_session_id, failed.autopilot_run_id, failed.attempt, failed.max_attempts, failed.parent_task_id, failed.failure_reason, failed.trigger_summary, failed.force_fresh_session, failed.is_leader_task, failed.wait_reason, failed.initiator_user_id, failed.handoff_note, failed.prepare_lease_expires_at, failed.squad_id, failed.runtime_mcp_overlay, failed.escalation_for_task_id, failed.fire_at, failed.originator_user_id, failed.runtime_connected_apps, failed.coalesced_comment_ids, failed.delivered_comment_ids, failed.chat_input_task_id, failed.chat_finalize_deferred_at, failed.originator_source, failed.delegated_from_task_id, failed.retry_of_task_id, failed.rerun_of_task_id, failed.rule_version_id, failed.trigger_evidence_kind, failed.trigger_evidence_ref_id, failed.accountable_user_id, failed.session_rollout_missing, failed.retired_session_id, failed.quick_actions_disabled, failed.regenerate_quick_actions_for, failed.branch_name, failed.durable_work_dir, failed.channel_context_revision, failed.comment_thread_id, failed.cancelled_by_type, failed.cancelled_by_id, failed.cancelled_by_name, failed.issue_snapshot, failed.workflow_step, failed.budget_project_ids FROM failed WHERE (SELECT changed FROM latch) >= 0
 `
 
 type FailCancelledTaskProcessCleanupParams struct {
-	ErrorMessage string      `json:"error_message"`
 	ID           pgtype.UUID `json:"id"`
+	ErrorMessage string      `json:"error_message"`
+}
+
+type FailCancelledTaskProcessCleanupRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	BranchName                pgtype.Text        `json:"branch_name"`
+	DurableWorkDir            pgtype.Text        `json:"durable_work_dir"`
+	ChannelContextRevision    pgtype.Int8        `json:"channel_context_revision"`
+	CommentThreadID           pgtype.UUID        `json:"comment_thread_id"`
+	CancelledByType           pgtype.Text        `json:"cancelled_by_type"`
+	CancelledByID             pgtype.UUID        `json:"cancelled_by_id"`
+	CancelledByName           pgtype.Text        `json:"cancelled_by_name"`
+	IssueSnapshot             []byte             `json:"issue_snapshot"`
+	WorkflowStep              pgtype.Text        `json:"workflow_step"`
+	BudgetProjectIds          []pgtype.UUID      `json:"budget_project_ids"`
 }
 
 // The daemon's cancellation acknowledgement can discover that local work did
 // NOT stop. Preserve the cancelled run's metadata but surface this as failure.
 // The status CAS makes replay harmless and leaves completed/failed rows alone.
-func (q *Queries) FailCancelledTaskProcessCleanup(ctx context.Context, arg FailCancelledTaskProcessCleanupParams) (AgentTaskQueue, error) {
-	row := q.db.QueryRow(ctx, failCancelledTaskProcessCleanup, arg.ErrorMessage, arg.ID)
-	var i AgentTaskQueue
+func (q *Queries) FailCancelledTaskProcessCleanup(ctx context.Context, arg FailCancelledTaskProcessCleanupParams) (FailCancelledTaskProcessCleanupRow, error) {
+	row := q.db.QueryRow(ctx, failCancelledTaskProcessCleanup, arg.ID, arg.ErrorMessage)
+	var i FailCancelledTaskProcessCleanupRow
 	err := row.Scan(
 		&i.ID,
 		&i.AgentID,

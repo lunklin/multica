@@ -306,7 +306,7 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 -- cannot monopolise the sweeper transaction. last_seen_at is normally set by
 -- the first heartbeat; updated_at is only the fallback for a never-heartbeated
 -- runtime, and a forced-offline write starts its grace from that update.
-WITH victims AS (
+WITH victims AS MATERIALIZED (
   SELECT task.id
   FROM agent_task_queue task
   JOIN agent_runtime runtime ON runtime.id = task.runtime_id
@@ -316,16 +316,28 @@ WITH victims AS (
         now() - make_interval(secs => @reconnect_grace_secs::double precision)
   ORDER BY COALESCE(runtime.last_seen_at, runtime.updated_at), task.created_at
   LIMIT @max_per_tick::int
-  FOR UPDATE OF task SKIP LOCKED
-)
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), locked_victims AS MATERIALIZED (
+    SELECT task.id FROM agent_task_queue task JOIN victims ON victims.id=task.id
+    WHERE (SELECT locked FROM budget_fence)>=0
+    FOR UPDATE OF task SKIP LOCKED
+), failed AS (
 UPDATE agent_task_queue AS task
 SET status = 'failed', completed_at = now(), error = 'runtime went offline',
     failure_reason = 'runtime_offline',
     wait_reason = NULL
-FROM victims
-WHERE task.id = victims.id
+FROM locked_victims
+WHERE task.id = locked_victims.id
   AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
-RETURNING task.*;
+  AND EXISTS (SELECT 1 FROM agent_runtime r WHERE r.id=task.runtime_id AND r.status='offline'
+      AND COALESCE(r.last_seen_at,r.updated_at)<now()-make_interval(secs => @reconnect_grace_secs::double precision))
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.*
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: ListAgentRuntimesByOwner :many
 SELECT * FROM agent_runtime

@@ -35,13 +35,13 @@ func TestProjectRunBudgetAPIUsageAndHumanResume(t *testing.T) {
 
 	var absent projectRunBudgetResponse
 	testutil.Call(t, testHandler.GetProjectRunBudget, projectBudgetRequest("GET", ws, project, nil)).Want(http.StatusOK).JSON(&absent)
-	if absent.Configured || absent.MaxRuns != nil || absent.RemainingRuns != nil || absent.ProjectID != project {
+	if absent.Configured || absent.MaxRuns != nil || absent.RemainingRuns != nil || absent.ProjectID != project || absent.StopOnFailure || absent.FailureTaskID != nil {
 		t.Fatalf("unconfigured project presented as a zero allowance: %+v", absent)
 	}
 	body := map[string]any{"max_runs": 6, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 0}
 	var initial projectRunBudgetResponse
 	testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, body)).Want(http.StatusOK).JSON(&initial)
-	if initial.ProjectID != project || initial.WorkspaceID != ws || !initial.Configured || initial.RemainingRuns == nil || *initial.RemainingRuns != 6 || initial.Revision != 1 {
+	if initial.ProjectID != project || initial.WorkspaceID != ws || !initial.Configured || initial.RemainingRuns == nil || *initial.RemainingRuns != 6 || initial.Revision != 1 || initial.StopOnFailure || initial.FailureTaskID != nil {
 		t.Fatalf("initial project budget: %+v", initial)
 	}
 	issue := fixture.Issue(t, "bounded project work", testutil.Cols{"project_id": project})
@@ -76,6 +76,67 @@ func TestProjectRunBudgetAPIUsageAndHumanResume(t *testing.T) {
 	}
 	body["expected_revision"], body["admitted_runs"] = 3, 0
 	testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, body)).Want(http.StatusBadRequest)
+}
+
+func TestProjectRunBudgetFailurePolicyCompatibilityAndExplicitResume(t *testing.T) {
+	ws, project, fixture := projectBudgetFixture(t)
+	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	body := map[string]any{"max_runs": 6, "deadline": deadline, "expected_revision": 0, "stop_on_failure": true}
+	var armed projectRunBudgetResponse
+	testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, body)).Want(http.StatusOK).JSON(&armed)
+	if !armed.StopOnFailure || armed.FailureTaskID != nil {
+		t.Fatalf("failure-stop policy was not armed: %+v", armed)
+	}
+	runtime := fixture.Runtime(t, "failure policy runtime")
+	agent := fixture.Agent(t, "failure policy agent", runtime)
+	issue := fixture.Issue(t, "failed bounded task", testutil.Cols{"project_id": project})
+	failed := fixture.Task(t, agent, testutil.Cols{"runtime_id": runtime, "issue_id": issue, "status": "failed"})
+	// Native failure transaction behavior is covered by the service tests. This
+	// fixture isolates the API's authority to acknowledge an existing latch.
+	if _, err := testPool.Exec(context.Background(), `UPDATE project_run_budget
+		SET paused=true,failure_task_id=$1,revision=revision+1 WHERE project_id=$2`, failed, project); err != nil {
+		t.Fatal(err)
+	}
+	var stopped projectRunBudgetResponse
+	testutil.Call(t, testHandler.GetProjectRunBudget, projectBudgetRequest("GET", ws, project, nil)).Want(http.StatusOK).JSON(&stopped)
+	if !stopped.Paused || stopped.StopReason != "failure_latch" || stopped.FailureTaskID == nil || *stopped.FailureTaskID != failed || stopped.AdmittedRuns != 1 || stopped.Revision != 2 {
+		t.Fatalf("failure cause did not take precedence over paused: %+v", stopped)
+	}
+	for _, field := range []string{"failure_task_id", "stop_reason", "admitted_runs", "clear_failure_latch"} {
+		invalid := map[string]any{"max_runs": 6, "deadline": deadline, "expected_revision": 2, field: nil}
+		testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, invalid)).Want(http.StatusBadRequest)
+	}
+	for _, tc := range []struct {
+		name       string
+		fields     map[string]any
+		wantPolicy bool
+	}{
+		{"old client omits policy and paused", nil, true},
+		{"null policy preserves it", map[string]any{"stop_on_failure": nil}, true},
+		{"disabling policy does not acknowledge failure", map[string]any{"stop_on_failure": false}, false},
+		{"explicit pause preserves cause", map[string]any{"paused": true}, false},
+		{"enabling policy still preserves cause", map[string]any{"stop_on_failure": true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			update := map[string]any{"max_runs": 6, "deadline": deadline, "expected_revision": stopped.Revision}
+			for key, value := range tc.fields {
+				update[key] = value
+			}
+			var next projectRunBudgetResponse
+			testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, update)).Want(http.StatusOK).JSON(&next)
+			if next.StopOnFailure != tc.wantPolicy || !next.Paused || next.FailureTaskID == nil || *next.FailureTaskID != failed || next.StopReason != "failure_latch" || next.AdmittedRuns != 1 || next.Revision != stopped.Revision+1 {
+				t.Fatalf("update cleared policy/cause or refunded usage: %+v", next)
+			}
+			stopped = next
+		})
+	}
+	resume := map[string]any{"max_runs": 6, "deadline": deadline, "expected_revision": stopped.Revision, "paused": false}
+	var resumed projectRunBudgetResponse
+	testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, resume)).Want(http.StatusOK).JSON(&resumed)
+	if resumed.Paused || resumed.FailureTaskID != nil || resumed.StopReason != "" || !resumed.StopOnFailure || resumed.AdmittedRuns != 1 || resumed.MaxRuns == nil || *resumed.MaxRuns != 6 || resumed.RemainingRuns == nil || *resumed.RemainingRuns != 5 || resumed.Revision != stopped.Revision+1 {
+		t.Fatalf("explicit human resume did not clear only the latch: %+v", resumed)
+	}
+	testutil.Call(t, testHandler.ConfigureProjectRunBudget, projectBudgetRequest("PUT", ws, project, resume)).Want(http.StatusConflict)
 }
 
 func TestProjectRunBudgetAPIRefusesArmingOverOwnedActiveRuns(t *testing.T) {

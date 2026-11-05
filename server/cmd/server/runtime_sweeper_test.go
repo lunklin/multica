@@ -12,6 +12,18 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// Native failure statements return their failed-state CAS rows. Convert only
+// at helpers that consume the common Task model; keep testing the raw queries.
+func sweptTaskRows[T interface {
+	db.FailStaleTasksRow | db.FailExpiredRuntimeReconnectRetriesRow | db.ExpireStaleQueuedTasksRow
+}](rows []T) []db.AgentTaskQueue {
+	tasks := make([]db.AgentTaskQueue, len(rows))
+	for i := range rows {
+		tasks[i] = db.AgentTaskQueue(rows[i])
+	}
+	return tasks
+}
+
 func TestPeriodicSweepStopsWithItsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	called := make(chan struct{}, 1)
@@ -320,7 +332,7 @@ func TestSweepStaleTasksBroadcastsWithWorkspaceID(t *testing.T) {
 	}
 
 	// Call broadcastFailedTasks — this is what we're testing
-	broadcastFailedTasks(context.Background(), queries, nil, bus, failedTasks)
+	broadcastFailedTasks(context.Background(), queries, nil, bus, sweptTaskRows(failedTasks))
 
 	// Verify the event was published with WorkspaceID (the core of the bug fix)
 	mu.Lock()
@@ -401,7 +413,7 @@ func TestSweepStaleTasksReconcileAgentStatus(t *testing.T) {
 		t.Fatal("expected at least 1 stale task")
 	}
 
-	broadcastFailedTasks(context.Background(), queries, nil, bus, failedTasks)
+	broadcastFailedTasks(context.Background(), queries, nil, bus, sweptTaskRows(failedTasks))
 
 	// Verify agent status is now "idle" in DB
 	var agentStatus string
@@ -466,7 +478,7 @@ func TestSweepDispatchedStaleTask(t *testing.T) {
 		t.Fatal("expected at least 1 stale dispatched task")
 	}
 
-	broadcastFailedTasks(context.Background(), queries, nil, bus, failedTasks)
+	broadcastFailedTasks(context.Background(), queries, nil, bus, sweptTaskRows(failedTasks))
 
 	// Verify DB: task should be failed
 	var status string
@@ -807,7 +819,7 @@ func TestRuntimeReconnectRetryHasBoundedTerminalPath(t *testing.T) {
 	}
 
 	taskSvc := service.NewTaskService(queries, testPool, nil, events.New())
-	taskSvc.HandleFailedTasks(ctx, failed)
+	taskSvc.HandleFailedTasks(ctx, sweptTaskRows(failed))
 
 	var issueStatus string
 	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, issueID).Scan(&issueStatus); err != nil {
@@ -913,7 +925,7 @@ func TestSweepResetsInProgressIssueToTodo(t *testing.T) {
 	}
 
 	// This is what we're testing: issue must be reset from in_progress → todo.
-	broadcastFailedTasks(ctx, queries, nil, bus, failedTasks)
+	broadcastFailedTasks(ctx, queries, nil, bus, sweptTaskRows(failedTasks))
 
 	var issueStatus string
 	err = testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, issueID).Scan(&issueStatus)
@@ -989,7 +1001,7 @@ func TestSweepDoesNotResetIssueAlreadyInReview(t *testing.T) {
 		t.Fatalf("FailStaleTasks failed: %v", err)
 	}
 
-	broadcastFailedTasks(ctx, queries, nil, bus, failedTasks)
+	broadcastFailedTasks(ctx, queries, nil, bus, sweptTaskRows(failedTasks))
 
 	// Issue should remain in_review — the sweeper must not clobber agent progress.
 	var issueStatus string
@@ -1112,7 +1124,7 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExpireStaleQueuedTasks (live runtime) failed: %v", err)
 	}
-	live := expiredIDs(survivors)
+	live := expiredIDs(sweptTaskRows(survivors))
 	if live[parseUUIDBytes(oldTaskID)] {
 		t.Fatal("live runtime: the 5h-old queued task was expired — queue age must not expire work behind a heartbeating runtime (MUL-6558)")
 	}
@@ -1130,7 +1142,7 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExpireStaleQueuedTasks (dead runtime) failed: %v", err)
 	}
-	expired := expiredIDs(failed)
+	expired := expiredIDs(sweptTaskRows(failed))
 	if !expired[parseUUIDBytes(oldTaskID)] {
 		t.Fatal("dead runtime: the 5h-old queued task should expire once its runtime is gone")
 	}
@@ -1207,7 +1219,7 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExpireStaleQueuedTasks (late enqueue) failed: %v", err)
 	}
-	if expiredIDs(lateSweep)[parseUUIDBytes(lateTaskID)] {
+	if expiredIDs(sweptTaskRows(lateSweep))[parseUUIDBytes(lateTaskID)] {
 		t.Fatal("a task enqueued against an already-offline runtime was failed immediately; it must get a full reconnect grace of its own to wait")
 	}
 
@@ -1224,7 +1236,7 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExpireStaleQueuedTasks (aged late enqueue) failed: %v", err)
 	}
-	if !expiredIDs(agedSweep)[parseUUIDBytes(lateTaskID)] {
+	if !expiredIDs(sweptTaskRows(agedSweep))[parseUUIDBytes(lateTaskID)] {
 		t.Fatal("a task that waited a full grace against a dead runtime should expire")
 	}
 }

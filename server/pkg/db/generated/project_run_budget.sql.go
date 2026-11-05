@@ -12,18 +12,19 @@ import (
 )
 
 const configureProjectRunBudget = `-- name: ConfigureProjectRunBudget :one
-INSERT INTO project_run_budget(workspace_id, project_id, max_runs, deadline, paused)
-VALUES ($1::uuid, $2::uuid, $3, $4, $5)
+INSERT INTO project_run_budget(workspace_id, project_id, max_runs, deadline, paused, stop_on_failure)
+VALUES ($1::uuid, $2::uuid, $3, $4, $5, COALESCE($6::boolean,false))
 ON CONFLICT (project_id) DO NOTHING
-RETURNING project_id, workspace_id, max_runs, admitted_runs, deadline, paused, revision, last_refusal, created_at, updated_at
+RETURNING project_id, workspace_id, max_runs, admitted_runs, deadline, paused, revision, last_refusal, created_at, updated_at, stop_on_failure, failure_task_id
 `
 
 type ConfigureProjectRunBudgetParams struct {
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	ProjectID   pgtype.UUID        `json:"project_id"`
-	MaxRuns     int64              `json:"max_runs"`
-	Deadline    pgtype.Timestamptz `json:"deadline"`
-	Paused      bool               `json:"paused"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	ProjectID     pgtype.UUID        `json:"project_id"`
+	MaxRuns       int64              `json:"max_runs"`
+	Deadline      pgtype.Timestamptz `json:"deadline"`
+	Paused        bool               `json:"paused"`
+	StopOnFailure pgtype.Bool        `json:"stop_on_failure"`
 }
 
 func (q *Queries) ConfigureProjectRunBudget(ctx context.Context, arg ConfigureProjectRunBudgetParams) (ProjectRunBudget, error) {
@@ -33,6 +34,7 @@ func (q *Queries) ConfigureProjectRunBudget(ctx context.Context, arg ConfigurePr
 		arg.MaxRuns,
 		arg.Deadline,
 		arg.Paused,
+		arg.StopOnFailure,
 	)
 	var i ProjectRunBudget
 	err := row.Scan(
@@ -46,12 +48,14 @@ func (q *Queries) ConfigureProjectRunBudget(ctx context.Context, arg ConfigurePr
 		&i.LastRefusal,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StopOnFailure,
+		&i.FailureTaskID,
 	)
 	return i, err
 }
 
 const getProjectRunBudget = `-- name: GetProjectRunBudget :one
-SELECT project_id, workspace_id, max_runs, admitted_runs, deadline, paused, revision, last_refusal, created_at, updated_at FROM project_run_budget
+SELECT project_id, workspace_id, max_runs, admitted_runs, deadline, paused, revision, last_refusal, created_at, updated_at, stop_on_failure, failure_task_id FROM project_run_budget
 WHERE workspace_id = $1::uuid AND project_id = $2::uuid
 `
 
@@ -74,8 +78,21 @@ func (q *Queries) GetProjectRunBudget(ctx context.Context, arg GetProjectRunBudg
 		&i.LastRefusal,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StopOnFailure,
+		&i.FailureTaskID,
 	)
 	return i, err
+}
+
+const isTaskProjectFailureBlocked = `-- name: IsTaskProjectFailureBlocked :one
+SELECT task_project_failure_blocked($1::uuid)::boolean AS blocked
+`
+
+func (q *Queries) IsTaskProjectFailureBlocked(ctx context.Context, taskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, isTaskProjectFailureBlocked, taskID)
+	var blocked bool
+	err := row.Scan(&blocked)
+	return blocked, err
 }
 
 const isTaskProjectRunBudgeted = `-- name: IsTaskProjectRunBudgeted :one
@@ -116,6 +133,17 @@ func (q *Queries) LockProjectForRunBudget(ctx context.Context, arg LockProjectFo
 	return id, err
 }
 
+const lockTaskProjectBudgets = `-- name: LockTaskProjectBudgets :one
+SELECT lock_task_project_budgets($1::uuid[])::bigint AS locked
+`
+
+func (q *Queries) LockTaskProjectBudgets(ctx context.Context, taskIds []pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, lockTaskProjectBudgets, taskIds)
+	var locked int64
+	err := row.Scan(&locked)
+	return locked, err
+}
+
 const projectHasUnfinishedBudgetRuns = `-- name: ProjectHasUnfinishedBudgetRuns :one
 SELECT EXISTS (
     SELECT 1
@@ -141,28 +169,35 @@ func (q *Queries) ProjectHasUnfinishedBudgetRuns(ctx context.Context, arg Projec
 
 const updateProjectRunBudget = `-- name: UpdateProjectRunBudget :one
 UPDATE project_run_budget
-SET max_runs = $1, deadline = $2, paused = $3,
+SET max_runs = $1, deadline = $2,
+    paused = CASE WHEN failure_task_id IS NOT NULL AND NOT $3::boolean THEN true ELSE $4 END,
+    failure_task_id = CASE WHEN $3::boolean AND NOT $4::boolean THEN NULL ELSE failure_task_id END,
+    stop_on_failure = COALESCE($5::boolean,stop_on_failure),
     revision = revision + 1, updated_at = clock_timestamp(), last_refusal = NULL
-WHERE workspace_id = $4::uuid AND project_id = $5::uuid
-  AND revision = $6
+WHERE workspace_id = $6::uuid AND project_id = $7::uuid
+  AND revision = $8
   AND $1 >= admitted_runs
-RETURNING project_id, workspace_id, max_runs, admitted_runs, deadline, paused, revision, last_refusal, created_at, updated_at
+RETURNING project_id, workspace_id, max_runs, admitted_runs, deadline, paused, revision, last_refusal, created_at, updated_at, stop_on_failure, failure_task_id
 `
 
 type UpdateProjectRunBudgetParams struct {
-	MaxRuns          int64              `json:"max_runs"`
-	Deadline         pgtype.Timestamptz `json:"deadline"`
-	Paused           bool               `json:"paused"`
-	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
-	ProjectID        pgtype.UUID        `json:"project_id"`
-	ExpectedRevision int64              `json:"expected_revision"`
+	MaxRuns           int64              `json:"max_runs"`
+	Deadline          pgtype.Timestamptz `json:"deadline"`
+	ClearFailureLatch bool               `json:"clear_failure_latch"`
+	Paused            bool               `json:"paused"`
+	StopOnFailure     pgtype.Bool        `json:"stop_on_failure"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	ProjectID         pgtype.UUID        `json:"project_id"`
+	ExpectedRevision  int64              `json:"expected_revision"`
 }
 
 func (q *Queries) UpdateProjectRunBudget(ctx context.Context, arg UpdateProjectRunBudgetParams) (ProjectRunBudget, error) {
 	row := q.db.QueryRow(ctx, updateProjectRunBudget,
 		arg.MaxRuns,
 		arg.Deadline,
+		arg.ClearFailureLatch,
 		arg.Paused,
+		arg.StopOnFailure,
 		arg.WorkspaceID,
 		arg.ProjectID,
 		arg.ExpectedRevision,
@@ -179,6 +214,8 @@ func (q *Queries) UpdateProjectRunBudget(ctx context.Context, arg UpdateProjectR
 		&i.LastRefusal,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StopOnFailure,
+		&i.FailureTaskID,
 	)
 	return i, err
 }

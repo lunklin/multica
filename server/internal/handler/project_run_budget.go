@@ -14,15 +14,22 @@ import (
 )
 
 type projectRunBudgetResponse struct {
-	ProjectID string `json:"project_id"`
+	ProjectID     string  `json:"project_id"`
+	StopOnFailure bool    `json:"stop_on_failure"`
+	FailureTaskID *string `json:"failure_task_id"`
 	workspaceRunBudgetResponse
 }
 
 func projectBudgetResponse(b db.ProjectRunBudget) projectRunBudgetResponse {
-	return projectRunBudgetResponse{ProjectID: uuidToString(b.ProjectID), workspaceRunBudgetResponse: runBudgetResponse(db.WorkspaceRunBudget{
-		WorkspaceID: b.WorkspaceID, MaxRuns: b.MaxRuns, AdmittedRuns: b.AdmittedRuns,
-		Deadline: b.Deadline, Paused: b.Paused, Revision: b.Revision,
-	})}
+	response := projectRunBudgetResponse{ProjectID: uuidToString(b.ProjectID), StopOnFailure: b.StopOnFailure,
+		FailureTaskID: uuidToPtr(b.FailureTaskID), workspaceRunBudgetResponse: runBudgetResponse(db.WorkspaceRunBudget{
+			WorkspaceID: b.WorkspaceID, MaxRuns: b.MaxRuns, AdmittedRuns: b.AdmittedRuns,
+			Deadline: b.Deadline, Paused: b.Paused, Revision: b.Revision,
+		})}
+	if b.FailureTaskID.Valid {
+		response.StopReason = "failure_latch"
+	}
+	return response
 }
 
 func (h *Handler) GetProjectRunBudget(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +69,8 @@ func (h *Handler) ConfigureProjectRunBudget(w http.ResponseWriter, r *http.Reque
 	var in struct {
 		MaxRuns          int64     `json:"max_runs"`
 		Deadline         time.Time `json:"deadline"`
-		Paused           bool      `json:"paused"`
+		Paused           *bool     `json:"paused"`
+		StopOnFailure    *bool     `json:"stop_on_failure"`
 		ExpectedRevision *int64    `json:"expected_revision"`
 	}
 	dec := json.NewDecoder(r.Body)
@@ -71,7 +79,8 @@ func (h *Handler) ConfigureProjectRunBudget(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "max_runs, deadline and expected_revision are required; usage cannot be reset")
 		return
 	}
-	if !in.Paused && !in.Deadline.After(time.Now()) {
+	paused := in.Paused != nil && *in.Paused
+	if !paused && !in.Deadline.After(time.Now()) {
 		writeError(w, http.StatusBadRequest, "an unpaused budget requires a future deadline")
 		return
 	}
@@ -93,6 +102,10 @@ func (h *Handler) ConfigureProjectRunBudget(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	deadline := pgtype.Timestamptz{Time: in.Deadline, Valid: true}
+	stopOnFailure := pgtype.Bool{}
+	if in.StopOnFailure != nil {
+		stopOnFailure = pgtype.Bool{Bool: *in.StopOnFailure, Valid: true}
+	}
 	var b db.ProjectRunBudget
 	if *in.ExpectedRevision == 0 {
 		active, activeErr := q.ProjectHasUnfinishedBudgetRuns(r.Context(), db.ProjectHasUnfinishedBudgetRunsParams{WorkspaceID: project.WorkspaceID, ProjectID: project.ID})
@@ -104,9 +117,10 @@ func (h *Handler) ConfigureProjectRunBudget(w http.ResponseWriter, r *http.Reque
 			writeErrorCode(w, http.StatusConflict, "run_budget_active_runs", "finish existing project runs before arming a budget")
 			return
 		}
-		b, err = q.ConfigureProjectRunBudget(r.Context(), db.ConfigureProjectRunBudgetParams{WorkspaceID: project.WorkspaceID, ProjectID: project.ID, MaxRuns: in.MaxRuns, Deadline: deadline, Paused: in.Paused})
+		b, err = q.ConfigureProjectRunBudget(r.Context(), db.ConfigureProjectRunBudgetParams{WorkspaceID: project.WorkspaceID, ProjectID: project.ID, MaxRuns: in.MaxRuns, Deadline: deadline, Paused: paused, StopOnFailure: stopOnFailure})
 	} else {
-		b, err = q.UpdateProjectRunBudget(r.Context(), db.UpdateProjectRunBudgetParams{WorkspaceID: project.WorkspaceID, ProjectID: project.ID, MaxRuns: in.MaxRuns, Deadline: deadline, Paused: in.Paused, ExpectedRevision: *in.ExpectedRevision})
+		b, err = q.UpdateProjectRunBudget(r.Context(), db.UpdateProjectRunBudgetParams{WorkspaceID: project.WorkspaceID, ProjectID: project.ID, MaxRuns: in.MaxRuns, Deadline: deadline, Paused: paused,
+			StopOnFailure: stopOnFailure, ClearFailureLatch: in.Paused != nil && !*in.Paused, ExpectedRevision: *in.ExpectedRevision})
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeErrorCode(w, http.StatusConflict, "run_budget_conflict", "revision changed or limit is below admitted usage")

@@ -752,6 +752,7 @@ WHERE id = (
     WHERE atq.agent_id = @agent_id
       AND atq.runtime_id = @runtime_id
       AND atq.status = 'queued'
+      AND NOT task_project_failure_blocked(atq.id)
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
       AND EXISTS (
           SELECT 1
@@ -867,6 +868,7 @@ WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
       AND atq.status = 'dispatched'
+      AND NOT task_project_failure_blocked(atq.id)
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
@@ -914,6 +916,7 @@ WITH candidates AS MATERIALIZED (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = ANY(@runtime_ids::uuid[])
       AND atq.status = 'dispatched'
+      AND NOT task_project_failure_blocked(atq.id)
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
@@ -967,9 +970,17 @@ RETURNING *;
 -- name: LockAgentTaskStartClaim :one
 -- Serialize start/replay with reclaim and cancellation. A stale delivery must
 -- never start or acknowledge a newer claim, even on the same runtime.
+WITH budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY[$1::uuid]) AS locked
+), budget_gate AS MATERIALIZED (
+    SELECT NOT task_project_failure_blocked($1::uuid) AS allowed
+    FROM budget_fence WHERE locked>=0
+)
 SELECT * FROM agent_task_queue
 WHERE id = $1 AND runtime_id = $2 AND dispatched_at = $3
   AND status IN ('dispatched', 'waiting_local_directory', 'running')
+  AND (SELECT count(*) FROM budget_gate)>=0
+  AND (status='running' OR (SELECT allowed FROM budget_gate))
 FOR UPDATE;
 
 -- name: MarkAgentTaskWaitingLocalDirectory :one
@@ -1163,7 +1174,13 @@ LIMIT 1;
 -- the COALESCE that would otherwise preserve a stale mid-flight pin — and flag
 -- the row, in the SAME transaction that creates and wakes the auto-retry, so the
 -- retry can never claim the bad pointer or miss the continuity gap.
-UPDATE agent_task_queue
+WITH victims AS MATERIALIZED (
+    SELECT candidate.id FROM agent_task_queue candidate
+    WHERE candidate.id = $1 AND candidate.status IN ('dispatched', 'running', 'waiting_local_directory')
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     completed_at = now(),
     error = $2,
@@ -1175,8 +1192,14 @@ SET status = 'failed',
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
     retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
-RETURNING *;
+WHERE (task.id = $1 AND task.status IN ('dispatched', 'running', 'waiting_local_directory'))
+  AND task.id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.*
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: UpdateAgentTaskSession :exec
 -- Pins the resume pointer mid-flight so a daemon crash leaves a usable
@@ -1208,15 +1231,27 @@ WHERE id = $1
 -- them to the auto-retry path. waiting_local_directory rows are included
 -- because the daemon holding the path lock is the same process that just
 -- died — without us, the row would sit waiting forever.
-UPDATE agent_task_queue
+WITH victims AS MATERIALIZED (
+    SELECT candidate.id FROM agent_task_queue candidate
+    WHERE candidate.runtime_id = $1 AND candidate.status IN ('dispatched', 'running', 'waiting_local_directory')
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     completed_at = now(),
     error = 'daemon restarted while task was in flight',
     failure_reason = 'runtime_recovery',
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
-WHERE runtime_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
-RETURNING *;
+WHERE (task.runtime_id = $1 AND task.status IN ('dispatched', 'running', 'waiting_local_directory'))
+  AND task.id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.*
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: FailStaleTasks :many
 -- Fails tasks stuck in dispatched/running beyond the given thresholds.
@@ -1251,11 +1286,9 @@ RETURNING *;
 -- of this task can exceed the dispatch / running timeouts without being
 -- "stuck". If the daemon dies, RecoverOrphanedTasksForRuntime reclaims
 -- those rows at restart.
-UPDATE agent_task_queue
-SET status = 'failed', completed_at = now(), error = 'task timed out',
-    failure_reason = 'timeout',
-    prepare_lease_expires_at = NULL
-WHERE (
+WITH victims AS MATERIALIZED (
+    SELECT id FROM agent_task_queue
+    WHERE (
     status = 'dispatched'
     AND dispatched_at < now() - make_interval(secs => @dispatch_timeout_secs::double precision)
     AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
@@ -1293,7 +1326,58 @@ WHERE (
       )
     )
   )
-RETURNING *;
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue
+SET status = 'failed', completed_at = now(), error = 'task timed out',
+    failure_reason = 'timeout',
+    prepare_lease_expires_at = NULL
+WHERE ((
+    status = 'dispatched'
+    AND dispatched_at < now() - make_interval(secs => @dispatch_timeout_secs::double precision)
+    AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
+    AND (
+      runtime_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+          AND (
+            (
+              r.status = 'online'
+              AND COALESCE(r.last_seen_at, r.updated_at) >=
+                  now() - make_interval(secs => @runtime_stale_secs::double precision)
+            )
+            OR COALESCE(r.last_seen_at, r.updated_at) <
+               now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
+          )
+      )
+    )
+  )
+   OR (
+    status = 'running'
+    AND started_at < now() - make_interval(secs => @running_timeout_secs::double precision)
+    AND (
+      runtime_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+          AND COALESCE(r.last_seen_at, r.updated_at) >=
+              now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
+      )
+    )
+  ))
+  AND id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING *
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: ExpireStaleQueuedTasks :many
 -- Expire queued work only when both the task's waiting age and the runtime's
@@ -1304,7 +1388,7 @@ RETURNING *;
 -- runtime_offline retries have a separate reconnect expiry policy and are exempt.
 -- Select bounded victims with SKIP LOCKED, then re-check status and liveness in
 -- the update so concurrent claims cannot be overwritten.
-WITH victims AS (
+WITH victims AS MATERIALIZED (
     SELECT id FROM agent_task_queue
     WHERE status = 'queued' AND context->>'wakeup_id' IS NULL
       AND created_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
@@ -1327,15 +1411,20 @@ WITH victims AS (
       )
     ORDER BY created_at ASC
     LIMIT @max_per_tick::int
-    FOR UPDATE SKIP LOCKED
-)
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), locked_victims AS MATERIALIZED (
+    SELECT task.id FROM agent_task_queue task JOIN victims ON victims.id=task.id
+    WHERE (SELECT locked FROM budget_fence)>=0
+    FOR UPDATE OF task SKIP LOCKED
+), failed AS (
 UPDATE agent_task_queue t
 SET status = 'failed',
     completed_at = now(),
     error = 'runtime unavailable while task was queued',
     failure_reason = 'queued_expired',
     prepare_lease_expires_at = NULL
-FROM victims v
+FROM locked_victims v
 WHERE t.id = v.id
   AND t.status = 'queued'
   AND t.created_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
@@ -1354,7 +1443,12 @@ WHERE t.id = v.id
       WHERE retry_parent.id = t.parent_task_id
         AND retry_parent.failure_reason = 'runtime_offline'
   )
-RETURNING t.*;
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING t.*
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: FailExpiredRuntimeReconnectRetries :many
 -- A runtime_offline retry waits in deferred until its runtime returns healthy.
@@ -1364,7 +1458,7 @@ RETURNING t.*;
 -- remains deferred for the next daemon poll to promote. The parent join is the
 -- lineage discriminator; provider backoff and other deferred task types are
 -- intentionally excluded.
-WITH victims AS (
+WITH victims AS MATERIALIZED (
     SELECT retry.id
     FROM agent_task_queue retry
     JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
@@ -1380,8 +1474,13 @@ WITH victims AS (
       )
     ORDER BY retry.fire_at, retry.created_at
     LIMIT @max_per_tick::int
-    FOR UPDATE OF retry SKIP LOCKED
-)
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), locked_victims AS MATERIALIZED (
+    SELECT task.id FROM agent_task_queue task JOIN victims ON victims.id=task.id
+    WHERE (SELECT locked FROM budget_fence)>=0
+    FOR UPDATE OF task SKIP LOCKED
+), failed AS (
 UPDATE agent_task_queue AS retry
 SET status = 'failed',
     completed_at = now(),
@@ -1389,8 +1488,8 @@ SET status = 'failed',
     failure_reason = 'runtime_reconnect_timeout',
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
-FROM victims
-WHERE retry.id = victims.id
+FROM locked_victims
+WHERE retry.id = locked_victims.id
   AND retry.status = 'deferred'
   AND retry.fire_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
   AND EXISTS (
@@ -1405,7 +1504,12 @@ WHERE retry.id = victims.id
         AND COALESCE(runtime.last_seen_at, runtime.updated_at) >=
             now() - make_interval(secs => @runtime_stale_secs::double precision)
   )
-RETURNING retry.*;
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING retry.*
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: CancelAgentTask :one
 -- Automatic cancellation without an explicit persisted failure reason. Unlike
@@ -2157,6 +2261,7 @@ ORDER BY priority DESC, created_at ASC;
 SELECT atq.* FROM agent_task_queue atq
 WHERE atq.runtime_id = $1
   AND atq.status = 'queued'
+      AND NOT task_project_failure_blocked(atq.id)
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
@@ -2278,6 +2383,7 @@ RETURNING *;
 SELECT atq.* FROM agent_task_queue atq
 WHERE atq.runtime_id = ANY(@runtime_ids::uuid[])
   AND atq.status = 'queued'
+      AND NOT task_project_failure_blocked(atq.id)
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.

@@ -39,7 +39,7 @@ func TestProjectRunBudgetAuthenticatedAuthority(t *testing.T) {
 		return r
 	}
 	ownerToken := userToken(testUserID)
-	initial := map[string]any{"max_runs": 6, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 0}
+	initial := map[string]any{"max_runs": 6, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 0, "stop_on_failure": true}
 	testutil.Call(t, router.ServeHTTP, request(http.MethodPut, ownerToken, initial)).Want(http.StatusOK)
 	taskToken := func(f *testutil.Fixture, workspace string) string {
 		t.Helper()
@@ -57,7 +57,7 @@ func TestProjectRunBudgetAuthenticatedAuthority(t *testing.T) {
 	member := fixture.User(t, "project budget member", fmt.Sprintf("project-budget-member-%d@example.test", time.Now().UnixNano()))
 	fixture.Member(t, ws, member, "member")
 	memberToken := userToken(member)
-	enlarge := map[string]any{"max_runs": 7, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 1}
+	enlarge := map[string]any{"max_runs": 7, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 1, "stop_on_failure": false, "paused": false}
 	for _, tc := range []struct {
 		name, method, token string
 		body                any
@@ -83,7 +83,7 @@ func TestProjectRunBudgetAuthenticatedAuthority(t *testing.T) {
 		})
 	}
 	b, err := testHandler.Queries.GetProjectRunBudget(context.Background(), db.GetProjectRunBudgetParams{WorkspaceID: parseUUID(ws), ProjectID: parseUUID(project)})
-	if err != nil || b.MaxRuns != 6 || b.Revision != 1 || b.AdmittedRuns != 0 {
+	if err != nil || b.MaxRuns != 6 || b.Revision != 1 || b.AdmittedRuns != 0 || !b.StopOnFailure {
 		t.Fatalf("rejected credentials changed budget: %+v, err=%v", b, err)
 	}
 	// Human authentication strips untrusted actor headers rather than treating
@@ -93,6 +93,14 @@ func TestProjectRunBudgetAuthenticatedAuthority(t *testing.T) {
 	r.Header.Set("X-Task-ID", "spoofed-task")
 	r.Header.Set("X-Actor-Source", "task_token")
 	testutil.Call(t, router.ServeHTTP, r).Want(http.StatusOK)
+	admin := fixture.User(t, "failure policy admin", fmt.Sprintf("failure-policy-admin-%d@example.test", time.Now().UnixNano()))
+	fixture.Member(t, ws, admin, "admin")
+	adminUpdate := map[string]any{"max_runs": 7, "deadline": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "expected_revision": 2, "paused": true, "stop_on_failure": true}
+	var adminResult projectRunBudgetResponse
+	testutil.Call(t, router.ServeHTTP, request(http.MethodPut, userToken(admin), adminUpdate)).Want(http.StatusOK).JSON(&adminResult)
+	if !adminResult.StopOnFailure || !adminResult.Paused || adminResult.Revision != 3 || adminResult.AdmittedRuns != 0 {
+		t.Fatalf("human admin could not configure failure policy without resetting usage: %+v", adminResult)
+	}
 }
 
 func TestProjectRunBudgetBlocksAgentRecurringRuleEscape(t *testing.T) {

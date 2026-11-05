@@ -4382,6 +4382,9 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, capabil
 	var change *qoderIssueChange
 	err := s.runInTx(ctx, func(q *db.Queries) error {
 		var err error
+		if err := lockQoderTaskLifecycle(ctx, q, taskID); err != nil {
+			return err
+		}
 		task, err = q.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{TaskID: taskID, EnableTaskSupplement: offered.Supplement, EnableProcessCleanup: offered.ProcessCleanup})
 		if err != nil {
 			return err
@@ -4410,6 +4413,9 @@ func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentT
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+	if err := lockQoderTaskLifecycle(ctx, qtx, claim.ID); err != nil {
+		return nil, fmt.Errorf("lock Qoder start issue: %w", err)
+	}
 	task, err := qtx.LockAgentTaskStartClaim(ctx, claim)
 	if err != nil {
 		return nil, fmt.Errorf("lock task start claim: %w", err)
@@ -4610,6 +4616,9 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 	// only after the transaction commits.
 	var chatAssistantMsg *db.ChatMessage
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if err := lockQoderTaskLifecycle(ctx, qtx, taskID); err != nil {
+			return err
+		}
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
@@ -5108,7 +5117,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
-		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
+		failedRow, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
 			ID:             taskID,
 			Error:          pgtype.Text{String: errMsg, Valid: true},
 			FailureReason:  pgtype.Text{String: failureReason, Valid: failureReason != ""},
@@ -5123,8 +5132,10 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			SessionRolloutMissing: sessionRolloutMissing,
 			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
 		})
+		t := db.AgentTaskQueue(failedRow)
 		if errors.Is(err, pgx.ErrNoRows) && failureReason == taskfailure.ReasonProcessCleanupUnconfirmed.String() {
-			t, err = qtx.FailCancelledTaskProcessCleanup(ctx, db.FailCancelledTaskProcessCleanupParams{ID: taskID, ErrorMessage: errMsg})
+			cleanup, cleanupErr := qtx.FailCancelledTaskProcessCleanup(ctx, db.FailCancelledTaskProcessCleanupParams{ID: taskID, ErrorMessage: errMsg})
+			t, err = db.AgentTaskQueue(cleanup), cleanupErr
 		}
 		if err != nil {
 			return err
@@ -5214,6 +5225,13 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		// can never abort this transaction — which also carries the parent's
 		// failed status.
 		createRetry := wantRetry
+		if createRetry {
+			blocked, err := qtx.IsTaskProjectFailureBlocked(ctx, t.ID)
+			if err != nil {
+				return fmt.Errorf("check failed project run latch: %w", err)
+			}
+			createRetry = !blocked
+		}
 		if createRetry {
 			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
 			if herr != nil {
@@ -6168,7 +6186,12 @@ func (s *TaskService) enqueueRerunTask(ctx context.Context, issue db.Issue, agen
 // offline past the reconnect grace.
 func (s *TaskService) FailTasksForOfflineRuntimes(ctx context.Context, arg db.FailTasksForOfflineRuntimesParams) ([]db.AgentTaskQueue, error) {
 	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
-		return qtx.FailTasksForOfflineRuntimes(ctx, arg)
+		rows, err := qtx.FailTasksForOfflineRuntimes(ctx, arg)
+		tasks := make([]db.AgentTaskQueue, len(rows))
+		for i := range rows {
+			tasks[i] = db.AgentTaskQueue(rows[i])
+		}
+		return tasks, err
 	})
 }
 
@@ -6176,28 +6199,48 @@ func (s *TaskService) FailTasksForOfflineRuntimes(ctx context.Context, arg db.Fa
 // terminal reconnect deadline.
 func (s *TaskService) FailExpiredRuntimeReconnectRetries(ctx context.Context, arg db.FailExpiredRuntimeReconnectRetriesParams) ([]db.AgentTaskQueue, error) {
 	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
-		return qtx.FailExpiredRuntimeReconnectRetries(ctx, arg)
+		rows, err := qtx.FailExpiredRuntimeReconnectRetries(ctx, arg)
+		tasks := make([]db.AgentTaskQueue, len(rows))
+		for i := range rows {
+			tasks[i] = db.AgentTaskQueue(rows[i])
+		}
+		return tasks, err
 	})
 }
 
 // FailStaleTasks fails claimed work whose runtime stopped reporting.
 func (s *TaskService) FailStaleTasks(ctx context.Context, arg db.FailStaleTasksParams) ([]db.AgentTaskQueue, error) {
 	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
-		return qtx.FailStaleTasks(ctx, arg)
+		rows, err := qtx.FailStaleTasks(ctx, arg)
+		tasks := make([]db.AgentTaskQueue, len(rows))
+		for i := range rows {
+			tasks[i] = db.AgentTaskQueue(rows[i])
+		}
+		return tasks, err
 	})
 }
 
 // ExpireStaleQueuedTasks fails queued work whose runtime never came back.
 func (s *TaskService) ExpireStaleQueuedTasks(ctx context.Context, arg db.ExpireStaleQueuedTasksParams) ([]db.AgentTaskQueue, error) {
 	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
-		return qtx.ExpireStaleQueuedTasks(ctx, arg)
+		rows, err := qtx.ExpireStaleQueuedTasks(ctx, arg)
+		tasks := make([]db.AgentTaskQueue, len(rows))
+		for i := range rows {
+			tasks[i] = db.AgentTaskQueue(rows[i])
+		}
+		return tasks, err
 	})
 }
 
 // RecoverOrphanedTasksForRuntime fails work a restarted daemon reports it lost.
 func (s *TaskService) RecoverOrphanedTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]db.AgentTaskQueue, error) {
 	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
-		return qtx.RecoverOrphanedTasksForRuntime(ctx, runtimeID)
+		rows, err := qtx.RecoverOrphanedTasksForRuntime(ctx, runtimeID)
+		tasks := make([]db.AgentTaskQueue, len(rows))
+		for i := range rows {
+			tasks[i] = db.AgentTaskQueue(rows[i])
+		}
+		return tasks, err
 	})
 }
 
@@ -6855,6 +6898,17 @@ func (s *TaskService) withDelegatedFailureRecoveryOwnership(ctx context.Context,
 		}
 		target.issue = issue
 		current := *target
+		if _, err := qtx.LockTaskProjectBudgets(ctx, []pgtype.UUID{current.failed.ID}); err != nil {
+			return err
+		}
+		blocked, err := qtx.IsTaskProjectFailureBlocked(ctx, current.failed.ID)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			stopped = true
+			return nil
+		}
 		comment, err := qtx.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{ID: current.comment.ID, WorkspaceID: issue.WorkspaceID})
 		if errors.Is(err, pgx.ErrNoRows) {
 			stopped = true
@@ -6944,6 +6998,12 @@ func (s *TaskService) withDelegatedFailureRecoveryOwnership(ctx context.Context,
 func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget, excludeTaskID pgtype.UUID) (delegatedFailureRecoveryDispatchOutcome, error) {
 	if target.comment.RecoverySettledAt.Valid {
 		return delegatedFailureRecoveryCovered, nil
+	}
+	// A failure latch also fences merging into an already admitted coordinator
+	// task. Keep the durable signal pending until a human explicitly resumes.
+	blocked, err := s.Queries.IsTaskProjectFailureBlocked(ctx, target.failed.ID)
+	if err != nil || blocked {
+		return delegatedFailureRecoveryCovered, err
 	}
 	// Signal creation has committed before reaching this shared dispatch path.
 	// Refresh the issue because its status may have changed since creation or
