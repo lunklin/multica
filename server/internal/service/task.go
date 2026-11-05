@@ -24,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/inbox"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
+	"github.com/multica-ai/multica/server/internal/issueworkflow"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
@@ -6747,14 +6748,19 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 		return false, err
 	}
 
-	if created && s.Bus != nil {
+	s.publishDelegatedFailureRecoveryNotice(target, exhaustedComment, created, exhaustedInbox, inboxCreated)
+	return created, nil
+}
+
+func (s *TaskService) publishDelegatedFailureRecoveryNotice(target *delegatedFailureRecoveryTarget, comment db.Comment, commentCreated bool, item db.InboxItem, inboxCreated bool) {
+	if commentCreated && s.Bus != nil {
 		s.Bus.Publish(events.Event{
 			Type:        protocol.EventCommentCreated,
 			WorkspaceID: util.UUIDToString(target.issue.WorkspaceID),
 			ActorType:   "system",
 			ActorID:     "",
 			Payload: map[string]any{
-				"comment":      commentEventFields(exhaustedComment),
+				"comment":      commentEventFields(comment),
 				"issue_title":  target.issue.Title,
 				"issue_status": target.issue.Status,
 			},
@@ -6767,26 +6773,164 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 			ActorType:   "system",
 			ActorID:     "",
 			Payload: map[string]any{"item": map[string]any{
-				"id":             util.UUIDToString(exhaustedInbox.ID),
-				"workspace_id":   util.UUIDToString(exhaustedInbox.WorkspaceID),
-				"recipient_type": exhaustedInbox.RecipientType,
-				"recipient_id":   util.UUIDToString(exhaustedInbox.RecipientID),
-				"type":           exhaustedInbox.Type,
-				"severity":       exhaustedInbox.Severity,
-				"issue_id":       util.UUIDToPtr(exhaustedInbox.IssueID),
-				"title":          exhaustedInbox.Title,
-				"body":           util.TextToPtr(exhaustedInbox.Body),
-				"read":           exhaustedInbox.Read,
-				"archived":       exhaustedInbox.Archived,
-				"created_at":     util.TimestampToString(exhaustedInbox.CreatedAt),
-				"actor_type":     util.TextToPtr(exhaustedInbox.ActorType),
-				"actor_id":       util.UUIDToPtr(exhaustedInbox.ActorID),
-				"details":        json.RawMessage(exhaustedInbox.Details),
+				"id":             util.UUIDToString(item.ID),
+				"workspace_id":   util.UUIDToString(item.WorkspaceID),
+				"recipient_type": item.RecipientType,
+				"recipient_id":   util.UUIDToString(item.RecipientID),
+				"type":           item.Type,
+				"severity":       item.Severity,
+				"issue_id":       util.UUIDToPtr(item.IssueID),
+				"title":          item.Title,
+				"body":           util.TextToPtr(item.Body),
+				"read":           item.Read,
+				"archived":       item.Archived,
+				"created_at":     util.TimestampToString(item.CreatedAt),
+				"actor_type":     util.TextToPtr(item.ActorType),
+				"actor_id":       util.UUIDToPtr(item.ActorID),
+				"details":        json.RawMessage(item.Details),
 				"issue_status":   target.issue.Status,
 			}},
 		})
 	}
-	return created, nil
+}
+
+// Match the claim's effective-assignee projection, including explicit overrides.
+// A workflow recovery must not spend a run on a coordinator briefed as an observer.
+func delegatedFailureRecoveryIsObserver(ctx context.Context, q *db.Queries, target *delegatedFailureRecoveryTarget) (bool, error) {
+	def, _, err := issueworkflow.ForProject(ctx, q, target.issue.WorkspaceID, target.issue.ProjectID)
+	if err != nil || def == nil {
+		return false, err
+	}
+	if def.IsDefault && !def.HandsOffAnywhere() {
+		return false, nil
+	}
+	if target.issue.AssigneeType.Valid && target.issue.AssigneeID.Valid {
+		switch target.issue.AssigneeType.String {
+		case "agent":
+			return target.issue.AssigneeID != target.agent.ID, nil
+		case "squad":
+			if target.source.SquadID != target.issue.AssigneeID {
+				return true, nil
+			}
+			squad, err := q.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: target.issue.AssigneeID, WorkspaceID: target.issue.WorkspaceID})
+			if errors.Is(err, pgx.ErrNoRows) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			return squad.LeaderID != target.agent.ID || target.source.SquadID != squad.ID, nil
+		}
+	}
+	return true, nil
+}
+
+// Human escalation is a terminal recovery outcome, not an Issue status change.
+// Keep the original signal and failed task; settle, explanation and inbox commit together.
+func (s *TaskService) withDelegatedFailureRecoveryOwnership(ctx context.Context, target *delegatedFailureRecoveryTarget, excludeTaskID pgtype.UUID, dispatch func(*db.Queries, *delegatedFailureRecoveryTarget) error) (bool, error) {
+	if s.TxStarter == nil {
+		return false, errors.New("delegated failure recovery requires a transaction")
+	}
+	var notice db.Comment
+	var item db.InboxItem
+	stopped, created, inboxCreated := false, false, false
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		// Squad leader rotation locks squad before agent. Stabilize the source
+		// squad first, then follow the queue fence's agent -> issue order.
+		if _, err := qtx.LockWorkspaceForChatSessionCreate(ctx, target.issue.WorkspaceID); err != nil {
+			return err
+		}
+		if target.source.SquadID.Valid {
+			_, err := qtx.LockSquadForAutopilotAssignment(ctx, db.LockSquadForAutopilotAssignmentParams{ID: target.source.SquadID, WorkspaceID: target.issue.WorkspaceID})
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+		if _, err := qtx.GetAgentForUpdate(ctx, target.agent.ID); err != nil {
+			return err
+		}
+		issue, err := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{ID: target.issue.ID, WorkspaceID: target.issue.WorkspaceID})
+		if err != nil {
+			return fmt.Errorf("lock recovery issue for human escalation: %w", err)
+		}
+		target.issue = issue
+		current := *target
+		comment, err := qtx.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{ID: current.comment.ID, WorkspaceID: issue.WorkspaceID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			stopped = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if comment.RecoverySettledAt.Valid {
+			stopped = true
+			return nil
+		}
+		allowed, err := canDispatchDelegatedFailureRecovery(ctx, qtx, issue)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			stopped = true
+			return nil
+		}
+		covered, err := qtx.HasTaskCoveringDelegatedFailureComment(ctx, db.HasTaskCoveringDelegatedFailureCommentParams{
+			IssueID: current.issue.ID, AgentID: current.agent.ID, CommentID: current.comment.ID, ExcludeTaskID: excludeTaskID,
+		})
+		if err != nil {
+			return fmt.Errorf("recheck recovery coverage before human escalation: %w", err)
+		}
+		if covered {
+			stopped = true
+			return nil
+		}
+		observer, err := delegatedFailureRecoveryIsObserver(ctx, qtx, &current)
+		if err != nil {
+			return err
+		}
+		if !observer {
+			return dispatch(qtx, &current)
+		}
+		settled, err := qtx.SettleDelegatedFailureRecoveryComment(ctx, current.comment.ID)
+		if err != nil {
+			return fmt.Errorf("settle observer recovery: %w", err)
+		}
+		stopped = true
+		if settled == 0 {
+			return nil
+		}
+		content := fmt.Sprintf("Delegated task `%s` needs human attention: source coordinator `%s` no longer owns the current workflow step `%s`. No observer recovery run was started. Issue status and ownership are unchanged; inspect the failed task and its preserved work before deciding how to continue. Source coordinator task: `%s`.",
+			util.UUIDToString(current.failed.ID), util.UUIDToString(current.agent.ID), current.issue.Status, util.UUIDToString(current.source.ID))
+		row, err := qtx.CreateComment(ctx, db.CreateCommentParams{ID: dbid.NewV7(), IssueID: current.issue.ID, WorkspaceID: current.issue.WorkspaceID,
+			AuthorType: "system", AuthorID: pgtype.UUID{Valid: true}, Content: content, Type: "system", ParentID: current.source.TriggerCommentID, SourceTaskID: current.failed.ID})
+		if err != nil {
+			return fmt.Errorf("create observer recovery explanation: %w", err)
+		}
+		notice, created = row.Comment(), true
+		_, recipient := delegatedFailureRecoveryAttribution(&current)
+		if recipient.Valid {
+			details, err := json.Marshal(map[string]any{"outcome": "needs_human", "reason": "coordinator_not_workflow_assignee",
+				"failed_task_id": util.UUIDToString(current.failed.ID), "source_task_id": util.UUIDToString(current.source.ID),
+				"coordinator_agent_id": util.UUIDToString(current.agent.ID), "current_status": current.issue.Status,
+				"assignee_type": util.TextToPtr(current.issue.AssigneeType), "assignee_id": util.UUIDToPtr(current.issue.AssigneeID)})
+			if err != nil {
+				return err
+			}
+			item, inboxCreated, err = inbox.CreateIfEligible(ctx, qtx, db.CreateInboxItemParams{ID: dbid.NewV7(), WorkspaceID: current.issue.WorkspaceID,
+				RecipientType: "member", RecipientID: recipient, Type: "task_failed", Severity: "action_required", IssueID: current.issue.ID,
+				Title: current.issue.Title, Body: pgtype.Text{String: content, Valid: true}, ActorType: pgtype.Text{String: "system", Valid: true}, Details: details})
+			if err != nil {
+				return fmt.Errorf("notify human about observer recovery: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	s.publishDelegatedFailureRecoveryNotice(target, notice, created, item, inboxCreated)
+	return stopped, nil
 }
 
 // dispatchDelegatedFailureRecovery routes a recovery comment to the source
@@ -6798,6 +6942,9 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 // reconciliation schedule the follow-up. The three-pass loop closes state
 // changes around those writes.
 func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget, excludeTaskID pgtype.UUID) (delegatedFailureRecoveryDispatchOutcome, error) {
+	if target.comment.RecoverySettledAt.Valid {
+		return delegatedFailureRecoveryCovered, nil
+	}
 	// Signal creation has committed before reaching this shared dispatch path.
 	// Refresh the issue because its status may have changed since creation or
 	// sweep selection; a paused/unreadable lifecycle never settles the signal.
@@ -6849,21 +6996,6 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			return delegatedFailureRecoveryCovered, nil
 		}
 
-		if merged, err := s.Queries.MergeDelegatedFailureCommentIntoPendingTask(ctx, db.MergeDelegatedFailureCommentIntoPendingTaskParams{
-			CommentID:      target.comment.ID,
-			TriggerSummary: s.buildCommentTriggerSummary(ctx, target.issue.WorkspaceID, target.comment.ID),
-			IssueID:        target.issue.ID,
-			AgentID:        target.agent.ID,
-		}); err == nil {
-			slog.Info("delegated failure recovery merged into pending coordinator task",
-				"failed_task_id", util.UUIDToString(target.failed.ID),
-				"coordinator_task_id", util.UUIDToString(merged.ID),
-			)
-			return delegatedFailureRecoveryReplayed, nil
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return delegatedFailureRecoveryCovered, fmt.Errorf("merge recovery into pending task: %w", err)
-		}
-
 		originator, accountable := delegatedFailureRecoveryAttribution(target)
 		source := attribution.SourceDelegation
 		if !originator.Valid && !accountable.Valid {
@@ -6874,27 +7006,54 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			ruleVersionID = target.source.RuleVersionID
 		}
 		overlay := s.buildRuntimeMCPOverlay(ctx, originator, target.agent)
-		task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-			ID:                   dbid.NewV7(),
-			AgentID:              target.agent.ID,
-			RuntimeID:            target.agent.RuntimeID,
-			IssueID:              target.issue.ID,
-			Priority:             priorityToInt(target.issue.Priority),
-			TriggerCommentID:     target.comment.ID,
-			TriggerSummary:       s.buildCommentTriggerSummary(ctx, target.issue.WorkspaceID, target.comment.ID),
-			IsLeaderTask:         pgtype.Bool{Bool: target.source.IsLeaderTask, Valid: target.source.IsLeaderTask},
-			SquadID:              target.source.SquadID,
-			OriginatorUserID:     originator,
-			AccountableUserID:    accountable,
-			RuntimeMcpOverlay:    overlay.Overlay,
-			RuntimeConnectedApps: overlay.ConnectedApps,
-			OriginatorSource:     pgtype.Text{String: string(source), Valid: true},
-			DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, target.failed.ID),
-			RuleVersionID:        ruleVersionID,
-			TriggerEvidenceKind:  pgtype.Text{String: string(attribution.EvidenceDelegatedFailure), Valid: true},
-			TriggerEvidenceRefID: target.failed.ID,
-			HeadSha:              headShaText(s.ResolveIssueReviewSHA(ctx, target.issue.ID)),
+		triggerSummary := s.buildCommentTriggerSummary(ctx, target.issue.WorkspaceID, target.comment.ID)
+		headSHA := headShaText(s.ResolveIssueReviewSHA(ctx, target.issue.ID))
+		var task db.AgentTaskQueue
+		merged := false
+		stopped, err := s.withDelegatedFailureRecoveryOwnership(ctx, target, excludeTaskID, func(qtx *db.Queries, current *delegatedFailureRecoveryTarget) error {
+			var err error
+			task, err = qtx.MergeDelegatedFailureCommentIntoPendingTask(ctx, db.MergeDelegatedFailureCommentIntoPendingTaskParams{
+				CommentID: target.comment.ID, TriggerSummary: triggerSummary,
+				IssueID: current.issue.ID, AgentID: target.agent.ID,
+			})
+			if err == nil {
+				merged = true
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("merge recovery into pending task: %w", err)
+			}
+			task, err = qtx.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+				ID:                   dbid.NewV7(),
+				AgentID:              target.agent.ID,
+				RuntimeID:            target.agent.RuntimeID,
+				IssueID:              current.issue.ID,
+				Priority:             priorityToInt(current.issue.Priority),
+				TriggerCommentID:     target.comment.ID,
+				TriggerSummary:       triggerSummary,
+				IsLeaderTask:         pgtype.Bool{Bool: target.source.IsLeaderTask, Valid: target.source.IsLeaderTask},
+				SquadID:              target.source.SquadID,
+				OriginatorUserID:     originator,
+				AccountableUserID:    accountable,
+				RuntimeMcpOverlay:    overlay.Overlay,
+				RuntimeConnectedApps: overlay.ConnectedApps,
+				OriginatorSource:     pgtype.Text{String: string(source), Valid: true},
+				DelegatedFromTaskID:  tasksource.DelegatedFrom(ctx, target.failed.ID),
+				RuleVersionID:        ruleVersionID,
+				TriggerEvidenceKind:  pgtype.Text{String: string(attribution.EvidenceDelegatedFailure), Valid: true},
+				TriggerEvidenceRefID: target.failed.ID,
+				HeadSha:              headSHA,
+			})
+			return err
 		})
+		if err == nil && stopped {
+			return delegatedFailureRecoveryCovered, nil
+		}
+		if err == nil && merged {
+			slog.Info("delegated failure recovery merged into pending coordinator task",
+				"failed_task_id", util.UUIDToString(target.failed.ID), "coordinator_task_id", util.UUIDToString(task.ID))
+			return delegatedFailureRecoveryReplayed, nil
+		}
 		if err == nil {
 			slog.Info("delegated failure recovery task enqueued",
 				"failed_task_id", util.UUIDToString(target.failed.ID),
@@ -6914,17 +7073,23 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 		// its claim payload is immutable. Register the comment as undelivered so
 		// its completion reconciliation creates the successor. Running tasks do
 		// not own that slot, so they took the durable queued-successor path above.
-		if active, err := s.Queries.RegisterPlannedCommentForActiveTask(ctx, db.RegisterPlannedCommentForActiveTaskParams{
-			CommentID: target.comment.ID,
-			IssueID:   target.issue.ID,
-			AgentID:   target.agent.ID,
-		}); err == nil {
+		var active db.RegisterPlannedCommentForActiveTaskRow
+		stopped, err = s.withDelegatedFailureRecoveryOwnership(ctx, target, excludeTaskID, func(qtx *db.Queries, current *delegatedFailureRecoveryTarget) error {
+			var err error
+			active, err = qtx.RegisterPlannedCommentForActiveTask(ctx, db.RegisterPlannedCommentForActiveTaskParams{
+				CommentID: target.comment.ID, IssueID: current.issue.ID, AgentID: target.agent.ID,
+			})
+			return err
+		})
+		if err == nil && stopped {
+			return delegatedFailureRecoveryCovered, nil
+		}
+		if err == nil {
 			slog.Info("delegated failure recovery registered behind dispatched coordinator task",
-				"failed_task_id", util.UUIDToString(target.failed.ID),
-				"coordinator_task_id", util.UUIDToString(active.ID),
-			)
+				"failed_task_id", util.UUIDToString(target.failed.ID), "coordinator_task_id", util.UUIDToString(active.ID))
 			return delegatedFailureRecoveryReplayed, nil
-		} else if !errors.Is(err, pgx.ErrNoRows) {
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
 			return delegatedFailureRecoveryCovered, fmt.Errorf("register recovery on dispatched task: %w", err)
 		}
 	}
