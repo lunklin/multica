@@ -38,14 +38,25 @@ SELECT EXISTS (
 -- The daemon's cancellation acknowledgement can discover that local work did
 -- NOT stop. Preserve the cancelled run's metadata but surface this as failure.
 -- The status CAS makes replay harmless and leaves completed/failed rows alone.
-UPDATE agent_task_queue
+WITH victims AS MATERIALIZED (
+    SELECT candidate.id FROM agent_task_queue candidate WHERE candidate.id = @id AND candidate.status='cancelled'
+), budget_fence AS MATERIALIZED (
+    SELECT lock_task_project_budgets(ARRAY(SELECT id FROM victims)) AS locked
+), failed AS (
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     error = concat_ws('; ', NULLIF(error, ''), @error_message::text),
     failure_reason = 'cleanup_unconfirmed',
     completed_at = now(),
     chat_finalize_deferred_at = NULL
-WHERE id = @id AND status = 'cancelled'
-RETURNING *;
+WHERE task.id = @id AND task.status = 'cancelled'
+  AND task.id IN (SELECT id FROM victims)
+  AND (SELECT locked FROM budget_fence) >= 0
+RETURNING task.*
+), latch AS MATERIALIZED (
+    SELECT latch_failed_project_budgets(ARRAY(SELECT id FROM failed)) AS changed
+)
+SELECT failed.* FROM failed WHERE (SELECT changed FROM latch) >= 0;
 
 -- name: MarkPiTaskProcessCleanupPending :exec
 -- Cancellation makes the task terminal before the daemon finishes stopping it.

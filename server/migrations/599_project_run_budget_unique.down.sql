@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS project_run_budget_project_unique;

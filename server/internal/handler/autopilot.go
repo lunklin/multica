@@ -806,6 +806,9 @@ func (h *Handler) requireAutopilotAccessManagement(w http.ResponseWriter, r *htt
 }
 
 func (h *Handler) CreateAutopilot(w http.ResponseWriter, r *http.Request) {
+	if h.refuseBudgetedAgentAutopilotWrite(w, r) {
+		return
+	}
 	var req CreateAutopilotRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -1037,6 +1040,9 @@ func (h *Handler) lockAndValidateAutopilotSubscribers(
 }
 
 func (h *Handler) UpdateAutopilot(w http.ResponseWriter, r *http.Request) {
+	if h.refuseBudgetedAgentAutopilotWrite(w, r) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
 
@@ -1337,6 +1343,9 @@ func (h *Handler) parseAutopilotProjectID(
 }
 
 func (h *Handler) DeleteAutopilot(w http.ResponseWriter, r *http.Request) {
+	if h.refuseBudgetedAgentAutopilotWrite(w, r) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
 
@@ -1512,6 +1521,9 @@ func (h *Handler) RemoveAutopilotCollaborator(w http.ResponseWriter, r *http.Req
 // ── Trigger management ──────────────────────────────────────────────────────
 
 func (h *Handler) CreateAutopilotTrigger(w http.ResponseWriter, r *http.Request) {
+	if h.refuseBudgetedAgentAutopilotWrite(w, r) {
+		return
+	}
 	autopilotID := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
 
@@ -1874,6 +1886,9 @@ func (h *Handler) validateAutopilotAssigneeForSave(
 }
 
 func (h *Handler) UpdateAutopilotTrigger(w http.ResponseWriter, r *http.Request) {
+	if h.refuseBudgetedAgentAutopilotWrite(w, r) {
+		return
+	}
 	autopilotID := chi.URLParam(r, "id")
 	triggerID := chi.URLParam(r, "triggerId")
 	workspaceID := h.resolveWorkspaceID(r)
@@ -2046,6 +2061,9 @@ func (h *Handler) UpdateAutopilotTrigger(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) DeleteAutopilotTrigger(w http.ResponseWriter, r *http.Request) {
+	if h.refuseBudgetedAgentAutopilotWrite(w, r) {
+		return
+	}
 	autopilotID := chi.URLParam(r, "id")
 	triggerID := chi.URLParam(r, "triggerId")
 	workspaceID := h.resolveWorkspaceID(r)

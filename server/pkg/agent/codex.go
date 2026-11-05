@@ -1913,7 +1913,12 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		// Scan the per-task session JSONL for either missing value. Session usage
 		// is only a fallback, so it must never replace a JSON-RPC usage sample.
 		taskCodexHome := strings.TrimSpace(b.cfg.Env["CODEX_HOME"])
-		usageMap = codexResultUsageMap(startTime, taskCodexHome, threadID, resumed, opts.Model, u)
+		var reviewAccounting codexGuardianAccounting
+		usageMap, reviewAccounting = codexResultUsageMap(startTime, time.Now(), taskCodexHome, threadID, resumed, opts.Model, u)
+		if reviewAccounting.Sessions > 0 {
+			detail, _ := json.Marshal(reviewAccounting)
+			msgCh <- Message{Type: MessageText, Content: "[Multica Runtime] Guardian safety-review usage included in Run totals; provider invoice cost unreported: " + string(detail)}
+		}
 
 		resCh <- Result{
 			Status:                       finalStatus,
@@ -4040,9 +4045,9 @@ func scanCodexSessionUsage(startTime time.Time, codexHome, threadID string, resu
 // codexResultUsageMap resolves a Codex result's model and usage without trading
 // one provider signal for another. JSON-RPC usage is authoritative when present;
 // the session log fills only a missing model. Session usage is used only when the
-// JSON-RPC path reported no tokens. A default-model run therefore remains
-// attributable instead of being stored as "unknown".
-func codexResultUsageMap(startTime time.Time, codexHome, threadID string, resumed bool, model string, usage TokenUsage) map[string]TokenUsage {
+// JSON-RPC path reported no tokens. Owned Guardian rollouts add their separate
+// inference within this execution window; they never replace parent counters.
+func codexResultUsageMap(startTime, endTime time.Time, codexHome, threadID string, resumed bool, model string, usage TokenUsage) (map[string]TokenUsage, codexGuardianAccounting) {
 	usageEmpty := usage.InputTokens == 0 && usage.OutputTokens == 0 &&
 		usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0
 	var scanned *codexSessionUsage
@@ -4055,13 +4060,14 @@ func codexResultUsageMap(startTime time.Time, codexHome, threadID string, resume
 	if model == "" && scanned != nil {
 		model = scanned.model
 	}
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 {
-		return nil
+	var result map[string]TokenUsage
+	if usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.CacheReadTokens != 0 || usage.CacheWriteTokens != 0 {
+		if model == "" {
+			model = "unknown"
+		}
+		result = map[string]TokenUsage{model: usage}
 	}
-	if model == "" {
-		model = "unknown"
-	}
-	return map[string]TokenUsage{model: usage}
+	return addCodexGuardianUsage(result, startTime, endTime, codexHome, threadID)
 }
 
 // findCodexSessionRollouts returns uncompressed rollout files owned by threadID
@@ -4234,6 +4240,10 @@ func parseCodexSessionFile(path string) *codexSessionUsage {
 // timestamp establishes the boundary; fresh sessions retain the previous
 // whole-file behavior because every event belongs to the new task.
 func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) *codexSessionUsage {
+	return parseCodexSessionFileWindow(path, startTime, time.Time{}, resumed)
+}
+
+func parseCodexSessionFileWindow(path string, startTime, endTime time.Time, resumed bool) *codexSessionUsage {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -4259,6 +4269,9 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 
 		var evt codexSessionTokenCount
 		if err := json.Unmarshal(line, &evt); err != nil || evt.Payload == nil {
+			continue
+		}
+		if !endTime.IsZero() && !evt.Timestamp.IsZero() && evt.Timestamp.After(endTime) {
 			continue
 		}
 		timestampAfterStart := !startTime.IsZero() && !evt.Timestamp.IsZero() && evt.Timestamp.After(startTime)

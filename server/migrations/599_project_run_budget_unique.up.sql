@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY project_run_budget_project_unique ON project_run_budget(project_id);
