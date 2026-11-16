@@ -6,11 +6,11 @@ Importing the production `handler` library does not import that package's
 `handler_test.go` or execute its TestMain. There is no server listener, migration
 runner, database initializer, Docker command, or product permission bypass here.
 
-Status at this source delivery: **NOT RUN** for formatting, compilation, offline
-controls, PostgreSQL, LocalStorage integration and process-boundary tests. The
-previously accepted e278 formal CLI SYN 44 controls are a different layer and
-were not repeated. The source candidate requires independent review and a new
-explicit execution window before any commands below are executed.
+The source-only snapshots 7ee/98e recorded formatting, compilation and dynamic
+checks as NOT RUN. Subsequent execution follows the issue's current bounded
+engineering contract; those historical snapshots are not runtime evidence.
+The previously accepted e278 formal CLI SYN44 controls are a different layer.
+This harness never grants permission to use a real or shared database.
 
 ## Entry and output contract
 
@@ -55,7 +55,11 @@ startup-error receipt fields. It creates only its own temporary SYN input files.
 There is no automatic skip from the DB suite to offline mode. In every execution
 mode, test.skip and test.list must be empty and test.count must equal1; otherwise
 Exit78 precedes any target access or m.Run. Help/version are explicit metadata
-commands and never emit a test PASS. These new regression sources are NOT RUN.
+commands and never emit a test PASS. Additional SYN controls use fixed /bin/sh
+scripts for success, exit23 and a CommandContext timeout; their public sentinel
+stdout/stderr include invalid UTF-8 bytes to check lossless receipt encoding.
+No shell text comes from a target, credential or user input. These are owned
+child-process controls, not PostgreSQL/OS crash tests.
 
 For a separately approved, initialized dedicated PostgreSQL 17 target only:
 
@@ -91,7 +95,7 @@ and lossless Base64 stdout/stderr. A failed start has no invented PID/code; a
 signal terminal with no numeric exit remains null. A failed parent test exposes
 its log even without -test.v; the documented verbose run preserves success logs
 too. Capturing buffers alone is not evidence publication. No child is spawned
-in this source delivery; the recorder and failure regressions are NOT RUN.
+by merely reading these sources; runtime claims require actual captured results.
 
 ## Dedicated target contract
 
