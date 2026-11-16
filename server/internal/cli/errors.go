@@ -689,6 +689,15 @@ func ExitCodeFor(err error) int {
 	if err == nil {
 		return 0
 	}
+	// Commands that already emitted a structured result preserve their documented
+	// tiered code instead of converting pending/permission states to success.
+	var commandExit interface{ ExitCode() int }
+	if errors.As(err, &commandExit) {
+		code := commandExit.ExitCode()
+		if code >= ExitGeneric && code <= ExitValidation {
+			return code
+		}
+	}
 
 	var netErr *NetworkError
 	if errors.As(err, &netErr) {

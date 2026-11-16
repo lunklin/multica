@@ -20,6 +20,10 @@ var versionCmd = &cobra.Command{
 }
 
 func runVersion(cmd *cobra.Command, _ []string) error {
+	server, _ := cmd.Flags().GetBool("server")
+	if server {
+		return runAttachmentAdmin(cmd, []string{"version", "--server"})
+	}
 	output, _ := cmd.Flags().GetString("output")
 
 	if output == "json" {

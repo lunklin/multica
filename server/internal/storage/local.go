@@ -135,6 +135,23 @@ func (s *LocalStorage) DeleteObject(_ context.Context, key string) error {
 	return nil
 }
 
+func (s *LocalStorage) VerifyDeleted(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	filePath := filepath.Join(s.uploadDir, key)
+	if key == "" || !isUnder(s.uploadDir, filePath) {
+		return fmt.Errorf("invalid primary object key")
+	}
+	for _, p := range []string{filePath, filePath + metaSuffix, tempPath(filePath)} {
+		_, err := os.Lstat(p)
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("primary object absence not verified")
+		}
+	}
+	return nil
+}
+
 // ObjectURL returns the URL a successful Upload/UploadStream of key would
 // return — a pure function of configuration, so the media intent ledger can
 // persist it BEFORE the upload.

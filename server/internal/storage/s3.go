@@ -3,9 +3,11 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -28,6 +30,21 @@ type S3Storage struct {
 	cdnDomain    string // if set, returned URLs use this instead of bucket name
 	endpointURL  string // custom S3-compatible endpoint (e.g. MinIO)
 	usePathStyle bool   // controls path-style S3 addressing
+}
+
+func (s *S3Storage) VerifyDeleted(ctx context.Context, key string) error {
+	if key == "" {
+		return fmt.Errorf("empty primary object key")
+	}
+	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	var response *smithyhttp.ResponseError
+	if errors.As(err, &response) && response.HTTPStatusCode() == http.StatusNotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("primary object still present")
 }
 
 // NewS3StorageFromEnv creates an S3Storage from environment variables.

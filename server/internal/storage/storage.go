@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// DeletionVerifier checks absence without fetching object bodies. It covers the
+// primary key only, not historical object versions, CDN caches or backups.
+type DeletionVerifier interface {
+	VerifyDeleted(context.Context, string) error
+}
+
 type Storage interface {
 	Upload(ctx context.Context, key string, data []byte, contentType string, filename string) (string, error)
 	Delete(ctx context.Context, key string)
