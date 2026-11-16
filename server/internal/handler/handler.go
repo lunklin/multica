@@ -162,6 +162,8 @@ type Config struct {
 	// Surfaced through /api/config so self-hosted operators can confirm which
 	// server build is deployed. Empty in dev builds.
 	ServerVersion string
+	// ServerCommit binds bounded management plans to the deployed source build.
+	ServerCommit string
 	// GitExtraCACerts is the PEM of the private CAs the operator added to the
 	// backend's trust store through SSL_CERT_DIR (see internal/gitca). It is
 	// handed to daemons with the workspace repos so their git can reach a
