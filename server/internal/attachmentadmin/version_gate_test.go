@@ -5,7 +5,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
@@ -14,10 +13,8 @@ import (
 )
 
 func TestCLICommitGateStopsEveryFollowup(t *testing.T) {
-	binary := os.Getenv("ADMIN_BINARY")
-	if binary == "" {
-		t.Skip("formal binary required")
-	}
+	binary, _ := testCLIBinary(t)
+	childDir := t.TempDir()
 	for _, commit := range []string{"", "unknown", "UNKNOWN", "abc123", " ", strings.Repeat("a", 39), strings.Repeat("g", 40)} {
 		t.Run("commit="+commit, func(t *testing.T) {
 			var followups atomic.Int32
@@ -33,12 +30,13 @@ func TestCLICommitGateStopsEveryFollowup(t *testing.T) {
 			defer server.Close()
 			for _, args := range [][]string{{"attachment", "inspect", id(10)}, {"attachment", "delete", id(10), "--dry-run", "--scope-file", "must-not-open.json"}, {"attachment", "delete", id(10), "--confirm-plan", id(98), "--request-id", id(99)}} {
 				cmd := exec.Command(binary, args...)
+				cmd.Dir = childDir
 				cmd.Env = []string{"MULTICA_SERVER_URL=" + server.URL, "MULTICA_WORKSPACE_ID=" + id(1), "MULTICA_TOKEN=SYN-owner"}
 				var stdout, stderr bytes.Buffer
 				cmd.Stdout = &stdout
 				cmd.Stderr = &stderr
 				start := time.Now().UTC()
-				cwd, _ := os.Getwd()
+				cwd := childDir
 				err := cmd.Run()
 				end := time.Now().UTC()
 				out := stdout.Bytes()

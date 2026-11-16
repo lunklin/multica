@@ -17,10 +17,8 @@ import (
 )
 
 func TestFormalCLI(t *testing.T) {
-	binary := os.Getenv("ADMIN_BINARY")
-	if binary == "" {
-		t.Skip("ADMIN_BINARY required: build formal standalone distribution first")
-	}
+	binary, native := testCLIBinary(t)
+	childDir := t.TempDir()
 	s, f, o, _, scope := setup(t)
 	var lost atomic.Bool
 	api := HTTP{Service: s, Actor: func(r *http.Request) (Actor, error) {
@@ -58,12 +56,16 @@ func TestFormalCLI(t *testing.T) {
 	}
 	run := func(label, token, workspace string, want int, args ...string) []byte {
 		t.Helper()
+		if native && len(args) == 1 && args[0] == "version" {
+			args = append(args, "--output", "json")
+		}
 		cmd := exec.Command(binary, args...)
+		cmd.Dir = childDir
 		cmd.Env = []string{"MULTICA_SERVER_URL=" + server.URL, "MULTICA_WORKSPACE_ID=" + workspace, "MULTICA_TOKEN=" + token}
 		var stdoutBuffer, stderrBuffer bytes.Buffer
 		cmd.Stdout = &stdoutBuffer
 		cmd.Stderr = &stderrBuffer
-		cwd, _ := os.Getwd()
+		cwd := childDir
 		start := time.Now().UTC()
 		err := cmd.Run()
 		end := time.Now().UTC()
@@ -167,6 +169,24 @@ func TestFormalCLI(t *testing.T) {
 	if len(f.image.Attachments) != 14 || len(f.image.Comments) != 1 || len(o.objects) != 14 {
 		t.Fatal("wrong final delta")
 	}
+}
+
+// An explicit candidate path is required; never discover or execute an installed
+// user CLI. Child processes inherit neither HOME/profile nor task credentials.
+func testCLIBinary(t *testing.T) (string, bool) {
+	t.Helper()
+	standalone, native := os.Getenv("ADMIN_BINARY"), os.Getenv("ADMIN_NATIVE_BINARY")
+	if standalone != "" && native != "" {
+		t.Fatal("select one explicit candidate CLI")
+	}
+	if native != "" {
+		return native, true
+	}
+	if standalone != "" {
+		return standalone, false
+	}
+	t.Skip("build and select ADMIN_BINARY or ADMIN_NATIVE_BINARY explicitly")
+	return "", false
 }
 
 func TestUnsupportedServerAndHelpNoNetwork(t *testing.T) {
