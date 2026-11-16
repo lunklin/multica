@@ -26,7 +26,7 @@ Use the already approved private Go absolute path and locked caches, with
 `GOMEMLIMIT=1GiB`, and private GOCACHE/GOMODCACHE/GOTMPDIR/GOPATH/out paths.
 Do not download or install anything to fill a missing dependency.
 
-From `server/`, after a new compile-only authorization:
+From `server/`, within the current authorized isolated engineering contract:
 
 ```sh
 "$PRIVATE_GO" test -c -tags=attachmentadminintegration \
@@ -189,11 +189,13 @@ receipts. Never reuse this harness against a shared database.
 
 ## Remaining execution dependencies and bounded preview
 
-1. **First independent source review**, then a new bounded formatter/compile and
-   offline-negative window using the already private Go/cache, no downloads,
-   no DB and no old44 rerun. Proposed maximum: 20 minutes, existing+new private
-   files ≤4GiB. Missing locked cache is a stop, not permission to fetch. This
-   source delivery has not requested or consumed that new window.
+1. After independent source review, follow the current bounded engineering
+   contract for formatting/compile/offline checks using the existing private
+   Go/cache, no downloads, no DB and no old44 rerun. The current slice allows
+   20 minutes and existing+new private files ≤4GiB. General engineering steps
+   do not require repeated member approval under the workspace autonomy policy.
+   Missing locked cache is a stop, not permission to fetch. Runtime results
+   belong to the recorded head/binary and receipts, not to these usage examples.
 2. Before real integration, a separate concrete environment approval must name
    an available, fixed PostgreSQL17 binary and provenance, private root, runtime
    quota, initialization/migration runner, SYN-only role and data/system identity
