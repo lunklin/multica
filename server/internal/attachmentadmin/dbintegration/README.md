@@ -48,8 +48,14 @@ The compiled verification binary provides:
 Help/version perform no file, environment, socket or database inspection.
 Offline mode only accepts that exact test selection, with no target or child
 mode, and exercises missing/unknown/non-SYN/symlink/public receipt rejection.
-It creates only its own temporary SYN input files. There is no automatic skip
-from the DB suite to offline mode.
+It also invokes the same compiled entry with skip/list/count=0 for offline, DB
+and child modes, checking the specific Exit78 refusal before target access;
+these nine owned children cannot reach a DB. A missing SYN executable covers
+startup-error receipt fields. It creates only its own temporary SYN input files.
+There is no automatic skip from the DB suite to offline mode. In every execution
+mode, test.skip and test.list must be empty and test.count must equal1; otherwise
+Exit78 precedes any target access or m.Run. Help/version are explicit metadata
+commands and never emit a test PASS. These new regression sources are NOT RUN.
 
 For a separately approved, initialized dedicated PostgreSQL 17 target only:
 
@@ -77,6 +83,15 @@ Preserve its actual exit, stdout and stderr separately. Do not dump environment,
 Authorization headers, tokens, DSNs or raw Auth bodies into any transcript.
 Only public SYN signing material and newly generated SYN task tokens are used;
 the harness discards production slog output and does not serialize those tokens.
+
+Every continuation/worker path now calls the same recordChild helper **before**
+checking exit status or calling Fatal. Its SYN_CHILD_RECEIPT log carries actual
+argv/cwd/UTC, available PID, nullable exit code, terminal/run/context error state,
+and lossless Base64 stdout/stderr. A failed start has no invented PID/code; a
+signal terminal with no numeric exit remains null. A failed parent test exposes
+its log even without -test.v; the documented verbose run preserves success logs
+too. Capturing buffers alone is not evidence publication. No child is spawned
+in this source delivery; the recorder and failure regressions are NOT RUN.
 
 ## Dedicated target contract
 

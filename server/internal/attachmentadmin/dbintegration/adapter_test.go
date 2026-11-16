@@ -146,9 +146,8 @@ func TestLostCommitResponseAndNewProcessResume(t *testing.T) {
 	cmd:=exec.CommandContext(ctx,binary,"-test.run=^TestResumeChild$","-syn-resume-child","-syn-target="+*targetFile,"-syn-opt-in="+optIn)
 	cmd.Env=[]string{"PATH=/usr/bin:/bin","TMPDIR="+selected.Root,"GOMAXPROCS=2","GOMEMLIMIT=1GiB"}
 	cmd.Dir=selected.Root; cmd.Stdin=bytes.NewReader(input)
-	var stdout,stderr bytes.Buffer; cmd.Stdout=&stdout; cmd.Stderr=&stderr
-	if err=cmd.Run(); err!=nil { t.Fatal("new process failed; child output retained by test runner only after SYN review") }
-	t.Logf("SYN child pid=%d exit=%d stdout=%q stderr=%q",cmd.Process.Pid,cmd.ProcessState.ExitCode(),stdout.String(),stderr.String())
+	child:=recordChild(t,ctx,cmd)
+	if child.RunError!="" || child.ExitCode==nil || *child.ExitCode!=0 { t.Fatal("new process failed; see preceding SYN_CHILD_RECEIPT") }
 	s.call("GET","operations/"+req,nil,200,&pending)
 	if pending.State!=attachmentadmin.Removed || s.objectExists(s.ids[0]) || s.preserved()!=preserved || s.f.Count(t,`SELECT count(*) FROM attachment_admin_record WHERE kind='operation' AND id=$1`,req)!=1 { t.Fatal("new-process continuation did not converge without collateral change") }
 }
@@ -189,12 +188,9 @@ func TestWorkerExitAfterCommit(t *testing.T) {
 		cmd:=exec.CommandContext(ctx,binary,"-test.run=^TestResumeChild$",phase,"-syn-target="+*targetFile,"-syn-opt-in="+optIn)
 		cmd.Env=[]string{"PATH=/usr/bin:/bin","TMPDIR="+selected.Root,"GOMAXPROCS=2","GOMEMLIMIT=1GiB"}
 		cmd.Dir=selected.Root; cmd.Stdin=bytes.NewReader(input)
-		var stdout,stderr bytes.Buffer; cmd.Stdout=&stdout; cmd.Stderr=&stderr
-		err=cmd.Run(); cancel()
-		if cmd.ProcessState==nil { t.Fatal("SYN worker did not start") }
+		child:=recordChild(t,ctx,cmd); cancel()
 		want:=0; if phase=="-syn-commit-exit-child" { want=86 }
-		if cmd.ProcessState.ExitCode()!=want || want==0 && err!=nil { t.Fatalf("SYN worker exit %d, want %d",cmd.ProcessState.ExitCode(),want) }
-		t.Logf("SYN worker pid=%d exit=%d stdout=%q stderr=%q",cmd.Process.Pid,cmd.ProcessState.ExitCode(),stdout.String(),stderr.String())
+		if child.ExitCode==nil || *child.ExitCode!=want || want==0 && child.RunError!="" { t.Fatalf("SYN worker did not reach expected exit %d; see preceding SYN_CHILD_RECEIPT",want) }
 		var op attachmentadmin.Operation; s.call("GET","operations/"+req,nil,200,&op)
 		if want==86 && (op.State!=attachmentadmin.Pending || s.exists(s.ids[0]) || !s.objectExists(s.ids[0])) { t.Fatal("post-commit process exit lost pending recipe") }
 		if want==0 && (op.State!=attachmentadmin.Removed || s.objectExists(s.ids[0])) { t.Fatal("fresh process failed continuation") }

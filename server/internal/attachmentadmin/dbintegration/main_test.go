@@ -19,7 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const harnessVersion = "0.1.0-source-candidate"
+const harnessVersion = "0.1.1-source-candidate"
 
 var targetFile = flag.String("syn-target", "", "absolute private INIT-RECEIPT.json; no default")
 var consent = flag.String("syn-opt-in", "", "must equal CHEE-199-DEDICATED-SYN-ONLY")
@@ -42,6 +42,12 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if *version { summary("SOURCE_CANDIDATE",0); os.Exit(0) }
+	// A successful m.Run can mean no assertion ran. Reject filtering/listing or
+	// zero/repeated counts before any mode reaches m.Run or opens a target.
+	for name, expected := range map[string]string{"test.skip":"", "test.list":"", "test.count":"1"} {
+		selection := flag.Lookup(name)
+		if selection == nil || selection.Value.String() != expected { summary("test_selection_would_change_required_coverage_NOT_RUN",78); os.Exit(78) }
+	}
 	if *offline {
 		if flag.Lookup("test.run").Value.String() != "^TestTargetContract$" || *targetFile != "" || *resumeChild || *commitExitChild { summary("invalid_offline_selection_NOT_RUN",78); os.Exit(78) }
 		os.Exit(m.Run())
