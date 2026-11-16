@@ -162,12 +162,14 @@ func (t *fixtureTx) DeleteAttachment(_ context.Context, m Metadata) error {
 
 type fixtureObjects struct {
 	sync.Mutex
-	objects    map[string]bool
-	fail       bool
-	calls      int
-	crash      bool
-	verifyFail bool
-	after      func()
+	objects       map[string]bool
+	fail          bool
+	calls         int
+	crash         bool
+	verifyFail    bool
+	namespace     string
+	binds, closed int
+	after         func()
 }
 
 func (o *fixtureObjects) Delete(_ context.Context, url string) error {
@@ -200,7 +202,7 @@ func setup(t *testing.T) (*Service, *fixtureStore, *fixtureObjects, Actor, Scope
 		o.objects[m.URL] = true
 		scope.IDs = append(scope.IDs, m.ID)
 	}
-	return &Service{Store: f, Objects: o, Version: "SYN-fixed-build/" + Capability}, f, o, Actor{ID: id(3), Workspace: id(1), Human: true}, scope
+	return &Service{Store: f, Objects: o, Version: "SYN-fixed-build/" + Capability, Commit: "1f515002a9940b6fb3cb9658822970ef9426c91c"}, f, o, Actor{ID: id(3), Workspace: id(1), Human: true}, scope
 }
 func mustPlan(t *testing.T, s *Service, a Actor, scope Scope) Plan {
 	t.Helper()
@@ -397,7 +399,7 @@ func TestProcessRecovery(t *testing.T) {
 	}
 	f := loadFixture(path)
 	_, _, o, a, _ := setup(t)
-	s := &Service{Store: f, Objects: o, Version: "SYN-fixed-build/" + Capability}
+	s := &Service{Store: f, Objects: o, Version: "SYN-fixed-build/" + Capability, Commit: "1f515002a9940b6fb3cb9658822970ef9426c91c"}
 	saved, err := s.Get(context.Background(), a, id(100))
 	if err != nil || saved.State != Pending || len(f.image.Attachments) != 15 {
 		t.Fatal("process-boundary receipt absent")
@@ -436,5 +438,78 @@ func TestUnverifiedStorageMustRemainPending(t *testing.T) {
 	done, err := s.Confirm(context.Background(), a, id(10), p.ID, id(100))
 	if err != nil || done.State != Removed {
 		t.Fatal(done, err)
+	}
+}
+
+// These fixtures are SYN namespaces; real namespace binding is tested against
+// LocalStorage and its operation-owned directory handle separately.
+func (o *fixtureObjects) Bind(ctx context.Context, url, expected string) (ObjectTarget, error) {
+	o.Lock()
+	defer o.Unlock()
+	ns := o.namespace
+	if ns == "" {
+		ns = "SYN-object-namespace-v1"
+	}
+	if expected != "" && expected != ns {
+		return nil, errors.New("SYN namespace changed")
+	}
+	o.binds++
+	return fixtureTarget{o, url, ns}, nil
+}
+
+type fixtureTarget struct {
+	o              *fixtureObjects
+	url, namespace string
+}
+
+func (t fixtureTarget) Namespace() string { return t.namespace }
+
+func (t fixtureTarget) Delete(ctx context.Context) error        { return t.o.Delete(ctx, t.url) }
+func (t fixtureTarget) VerifyDeleted(ctx context.Context) error { return t.o.VerifyDeleted(ctx, t.url) }
+func (t fixtureTarget) Close() error                            { t.o.Lock(); defer t.o.Unlock(); t.o.closed++; return nil }
+
+func TestPendingAndPlanStorageNamespaceDrift(t *testing.T) {
+	for _, when := range []string{"after-preview", "after-pending", "legacy-unbound"} {
+		t.Run(when, func(t *testing.T) {
+			s, f, o, a, scope := setup(t)
+			p := mustPlan(t, s, a, scope)
+			if when != "after-preview" {
+				o.fail = true
+				op, err := s.Confirm(context.Background(), a, id(10), p.ID, id(100))
+				if err != nil || op.State != Pending {
+					t.Fatal(op, err)
+				}
+				o.fail = false
+			}
+			if when == "legacy-unbound" {
+				op := f.image.Operations[id(100)]
+				op.StorageNamespace = ""
+				f.image.Operations[id(100)] = op
+			}
+			before := clone(f.image)
+			beforeCalls := o.calls
+			o.namespace = "SYN-another-storage-root"
+			op, err := s.Confirm(context.Background(), a, id(10), p.ID, id(100))
+			if err != nil || op.State == Removed || o.calls != beforeCalls {
+				t.Fatal("namespace drift caused cleanup", op, err, o.calls, beforeCalls)
+			}
+			unchanged(t, f, before)
+			if when == "after-preview" && op.State != Rejected {
+				t.Fatal("drift before metadata change was not rejected")
+			}
+			if when != "after-preview" && op.State != Pending {
+				t.Fatal("existing pending lost")
+			}
+			o.namespace = ""
+			if when == "after-pending" {
+				done, err := s.Confirm(context.Background(), a, id(10), p.ID, id(100))
+				if err != nil || done.State != Removed {
+					t.Fatal("stable original source could not resume", done, err)
+				}
+			}
+			if o.binds != o.closed {
+				t.Fatal("operation targets were not closed", o.binds, o.closed)
+			}
+		})
 	}
 }

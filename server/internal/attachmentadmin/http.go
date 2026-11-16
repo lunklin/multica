@@ -62,8 +62,10 @@ func (h HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reason := ""
 			if m.Captured {
 				reason = "captured_context_immutable"
+			} else if _, err := h.Service.storageNamespace(r.Context(), m.URL); err != nil {
+				reason = "storage_namespace_unavailable"
 			}
-			respond(w, map[string]any{"metadata": m, "can_delete": !m.Captured, "reason": reason}, nil)
+			respond(w, map[string]any{"metadata": m, "can_delete": reason == "", "reason": reason}, nil)
 		} else {
 			respond(w, nil, err)
 		}

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const CLIVersion = "0.1.0-candidate"
+const CLIVersion = "0.1.1-candidate"
 const Help = `Bounded human Owner attachment administration (candidate; not deployed).
 Commands (JSON output, no prompts):
   version [--server] [--output json]
@@ -117,7 +117,7 @@ func RunCLI(ctx context.Context, args []string, c CLIConfig, out, errout io.Writ
 	if exit := call("GET", "version", nil, &v); exit != 0 {
 		return exit
 	}
-	if v.Capability != Capability || v.Build == "" {
+	if v.Capability != Capability || strings.TrimSpace(v.Build) == "" || strings.EqualFold(strings.TrimSpace(v.Build), "unknown") || !ValidCommit(v.Commit) {
 		return bad("unsupported_server_capability", 5)
 	}
 	if args[0] == "version" {

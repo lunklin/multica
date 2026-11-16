@@ -31,7 +31,7 @@ func (h *Handler) AttachmentAdmin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"code": "invalid_workspace"})
 		return
 	}
-	if h.cfg.ServerVersion == "" || h.cfg.ServerCommit == "" || h.cfg.ServerCommit == "unknown" {
+	if h.cfg.ServerVersion == "" || !attachmentadmin.ValidCommit(h.cfg.ServerCommit) {
 		writeJSON(w, 503, map[string]string{"code": "server_build_unknown"})
 		return
 	}
@@ -48,20 +48,24 @@ func (h *Handler) AttachmentAdmin(w http.ResponseWriter, r *http.Request) {
 
 type adminObjects struct{ storage.Storage }
 
-func (o adminObjects) Delete(ctx context.Context, rawURL string) error {
+func (o adminObjects) Bind(ctx context.Context, rawURL, expectedNamespace string) (attachmentadmin.ObjectTarget, error) {
 	key := o.KeyFromURL(rawURL)
-	if key == "" || path.Clean(key) != key || strings.HasPrefix(key, "/") || strings.ContainsAny(key, "\\\x00?#") || key == ".." || strings.HasPrefix(key, "../") || o.ObjectURL(key) != rawURL {
-		return errors.New("unrecognized object location")
+	if key == "" || key == "." || path.Clean(key) != key || strings.HasPrefix(key, "/") || strings.ContainsAny(key, "\\\x00?#") || key == ".." || strings.HasPrefix(key, "../") || o.ObjectURL(key) != rawURL {
+		return nil, errors.New("unrecognized object location")
 	}
-	return o.DeleteObject(ctx, key)
-}
-
-func (o adminObjects) VerifyDeleted(ctx context.Context, rawURL string) error {
-	verifier, ok := o.Storage.(storage.DeletionVerifier)
+	binder, ok := o.Storage.(storage.DeletionBinder)
 	if !ok {
-		return errors.New("primary storage verification unavailable")
+		return nil, errors.New("storage namespace binding unavailable")
 	}
-	return verifier.VerifyDeleted(ctx, o.KeyFromURL(rawURL))
+	target, err := binder.BindDeletion(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if target.Namespace() == "" || expectedNamespace != "" && target.Namespace() != expectedNamespace {
+		_ = target.Close()
+		return nil, errors.New("storage namespace changed")
+	}
+	return target, nil
 }
 
 type adminStore struct{ h *Handler }
@@ -171,12 +175,20 @@ func (t *adminTx) put(ctx context.Context, kind, id, actor string, value any) er
 	return nil
 }
 func (t *adminTx) Plan(ctx context.Context, id string) (attachmentadmin.Plan, error) {
-	var p attachmentadmin.Plan
-	err := t.read(ctx, "plan", id, &p)
-	return p, err
+	var stored struct {
+		Plan      attachmentadmin.Plan `json:"plan"`
+		Namespace string               `json:"storage_namespace"`
+	}
+	err := t.read(ctx, "plan", id, &stored)
+	stored.Plan.StorageNamespace = stored.Namespace
+	return stored.Plan, err
 }
 func (t *adminTx) PutPlan(ctx context.Context, p attachmentadmin.Plan) error {
-	return t.put(ctx, "plan", p.ID, p.Actor, p)
+	stored := struct {
+		Plan      attachmentadmin.Plan `json:"plan"`
+		Namespace string               `json:"storage_namespace"`
+	}{p, p.StorageNamespace}
+	return t.put(ctx, "plan", p.ID, p.Actor, stored)
 }
 func (t *adminTx) Operation(ctx context.Context, id string) (attachmentadmin.StoredOperation, error) {
 	var op attachmentadmin.StoredOperation

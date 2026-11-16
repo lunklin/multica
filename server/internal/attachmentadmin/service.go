@@ -49,13 +49,14 @@ type Scope struct {
 	IDs       []string `json:"attachment_ids"`
 }
 type Plan struct {
-	ID          string    `json:"id"`
-	Actor       string    `json:"actor_id"`
-	Version     string    `json:"server_version"`
-	Scope       Scope     `json:"scope"`
-	Target      Metadata  `json:"target"`
-	Fingerprint string    `json:"metadata_fingerprint"`
-	Expires     time.Time `json:"expires_at"`
+	ID               string    `json:"id"`
+	Actor            string    `json:"actor_id"`
+	Version          string    `json:"server_version"`
+	Scope            Scope     `json:"scope"`
+	Target           Metadata  `json:"target"`
+	Fingerprint      string    `json:"metadata_fingerprint"`
+	Expires          time.Time `json:"expires_at"`
+	StorageNamespace string    `json:"-"`
 }
 type Operation struct {
 	ID                string     `json:"request_id"`
@@ -77,8 +78,9 @@ type Operation struct {
 // StoredOperation keeps the object location private and durable before the row
 // is removed. Only Operation is ever returned to callers.
 type StoredOperation struct {
-	Receipt   Operation `json:"receipt"`
-	ObjectURL string    `json:"object_url"`
+	Receipt          Operation `json:"receipt"`
+	ObjectURL        string    `json:"object_url"`
+	StorageNamespace string    `json:"storage_namespace"`
 }
 
 // Transaction must atomically commit the callback or roll it back. It must
@@ -96,8 +98,16 @@ type Tx interface {
 	DeleteAttachment(context.Context, Metadata) error
 }
 type ObjectStore interface {
-	Delete(context.Context, string) error
-	VerifyDeleted(context.Context, string) error
+	Bind(context.Context, string, string) (ObjectTarget, error)
+}
+
+// A target pins the storage namespace for the entire deletion and verification.
+// Close releases only this operation's resources, never a shared storage client.
+type ObjectTarget interface {
+	Namespace() string
+	Delete(context.Context) error
+	VerifyDeleted(context.Context) error
+	Close() error
 }
 type Service struct {
 	Store         Store
@@ -110,6 +120,9 @@ type Service struct {
 
 var ErrMissing = errors.New("missing")
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func ValidCommit(value string) bool { return commitPattern.MatchString(value) }
 
 func ValidID(id string) bool { return uuidPattern.MatchString(id) }
 func newID() string {
@@ -155,6 +168,19 @@ func (s *Service) Inspect(ctx context.Context, a Actor, id string) (Metadata, er
 	err := s.transaction(ctx, a, func(tx Tx) error { var err error; m, err = tx.Attachment(ctx, id); return err })
 	return m, err
 }
+func (s *Service) storageNamespace(ctx context.Context, url string) (string, error) {
+	if s.Objects == nil || url == "" {
+		return "", fail("storage_namespace_unavailable", 503)
+	}
+	target, err := s.Objects.Bind(ctx, url, "")
+	if target != nil {
+		defer target.Close()
+	}
+	if err != nil || target == nil || target.Namespace() == "" {
+		return "", fail("storage_namespace_unavailable", 503)
+	}
+	return target.Namespace(), nil
+}
 func (s *Service) Preview(ctx context.Context, a Actor, id string, scope Scope) (Plan, error) {
 	var p Plan
 	if !ValidID(id) || !ValidID(scope.Issue) || scope.Workspace != a.Workspace || len(scope.IDs) != 16 {
@@ -183,7 +209,11 @@ func (s *Service) Preview(ctx context.Context, a Actor, id string, scope Scope) 
 		if m.Workspace != scope.Workspace || m.Issue != scope.Issue {
 			return fail("scope_mismatch", 409)
 		}
-		p = Plan{newID(), a.ID, s.Version, scope, m, fingerprint(m), s.now().Add(10 * time.Minute)}
+		namespace, err := s.storageNamespace(ctx, m.URL)
+		if err != nil {
+			return err
+		}
+		p = Plan{ID: newID(), Actor: a.ID, Version: s.Version, Scope: scope, Target: m, Fingerprint: fingerprint(m), Expires: s.now().Add(10 * time.Minute), StorageNamespace: namespace}
 		return tx.PutPlan(ctx, p)
 	})
 	return p, err
@@ -208,6 +238,12 @@ func (s *Service) Get(ctx context.Context, a Actor, id string) (Operation, error
 }
 func (s *Service) Confirm(ctx context.Context, a Actor, target, planID, requestID string) (Operation, error) {
 	var op StoredOperation
+	var object ObjectTarget
+	defer func() {
+		if object != nil {
+			_ = object.Close()
+		}
+	}()
 	if !ValidID(target) || !ValidID(planID) || !ValidID(requestID) {
 		return op.Receipt, fail("invalid_confirmation", 400)
 	}
@@ -251,7 +287,17 @@ func (s *Service) Confirm(ctx context.Context, a Actor, target, planID, requestI
 		if s.Objects == nil || m.URL == "" {
 			return fail("storage_unavailable", 503)
 		}
-		op = StoredOperation{Receipt: Operation{ID: requestID, PlanID: planID, Actor: a.ID, Version: s.Version, ClientVersion: s.ClientVersion, Target: m, Started: s.now(), State: Pending, MetadataRemoved: true, PlatformRetrieval: "ROW_REMOVED", PrimaryStorage: "PENDING", RemainingCopies: "CDN_URL_VERSIONS_BACKUPS_NOT_VERIFIED"}, ObjectURL: m.URL}
+		if p.StorageNamespace == "" {
+			return reject("plan_storage_namespace_unbound")
+		}
+		object, err = s.Objects.Bind(ctx, m.URL, p.StorageNamespace)
+		if err != nil || object == nil || object.Namespace() == "" {
+			return reject("storage_namespace_unavailable_or_changed")
+		}
+		if object.Namespace() != p.StorageNamespace {
+			return reject("storage_namespace_unavailable_or_changed")
+		}
+		op = StoredOperation{Receipt: Operation{ID: requestID, PlanID: planID, Actor: a.ID, Version: s.Version, ClientVersion: s.ClientVersion, Target: m, Started: s.now(), State: Pending, MetadataRemoved: true, PlatformRetrieval: "ROW_REMOVED", PrimaryStorage: "PENDING", RemainingCopies: "CDN_URL_VERSIONS_BACKUPS_NOT_VERIFIED"}, ObjectURL: m.URL, StorageNamespace: object.Namespace()}
 		if err := tx.PutOperation(ctx, op); err != nil {
 			return err
 		}
@@ -271,10 +317,36 @@ func (s *Service) Confirm(ctx context.Context, a Actor, target, planID, requestI
 	if ctx.Err() != nil {
 		return op.Receipt, ctx.Err()
 	}
-	cleanupErr := s.Objects.Delete(ctx, op.ObjectURL)
+	// Never infer a missing historical namespace from the current configuration.
+	// A URL alone can name another empty directory after a service restart.
+	var bindErr error
+	if object == nil && op.StorageNamespace != "" {
+		object, bindErr = s.Objects.Bind(ctx, op.ObjectURL, op.StorageNamespace)
+	}
+	if op.StorageNamespace == "" || bindErr != nil || object == nil || object.Namespace() != op.StorageNamespace {
+		err = s.transaction(ctx, a, func(tx Tx) error {
+			current, err := tx.Operation(ctx, requestID)
+			if err != nil {
+				return err
+			}
+			if current.Receipt.State != Removed {
+				current.Receipt.Reason = "storage_namespace_unavailable_or_changed"
+				if current.StorageNamespace == "" {
+					current.Receipt.Reason = "storage_namespace_unbound"
+				}
+				if err = tx.PutOperation(ctx, current); err != nil {
+					return err
+				}
+			}
+			op = current
+			return nil
+		})
+		return op.Receipt, err
+	}
+	cleanupErr := object.Delete(ctx)
 	verificationFailed := false
 	if cleanupErr == nil {
-		cleanupErr = s.Objects.VerifyDeleted(ctx, op.ObjectURL)
+		cleanupErr = object.VerifyDeleted(ctx)
 		verificationFailed = cleanupErr != nil
 	}
 	err = s.transaction(ctx, a, func(tx Tx) error {

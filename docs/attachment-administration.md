@@ -74,11 +74,13 @@ transaction's existing issue -> comment -> attachment lock order. Drift,
 expired/version-changed plans and captured-context targets are refused.
 Captured-context historical copies remain immutable; no parent-delete workaround.
 Private chat/task uploads outside the issue scope are not managed by this route.
+The CLI requires a full lowercase 40-hex server commit before any followup
+inspect/plan/confirm; missing, unknown or malformed commits exit 5.
 
 ## Receipts and ambiguous outcomes
 
 The candidate PostgreSQL adapter commits the request receipt, private cleanup
-location and attachment-row deletion **in the same transaction**. Comments,
+location, bound storage namespace and attachment-row deletion **in the same transaction**. Comments,
 replies, other attachments and incident history are not deleted or rewritten.
 Existing `DeleteAttachment` query increments owner revisions as before.
 Workspace serialization plus a globally unique `(kind,id)` index protects
@@ -88,6 +90,10 @@ Public receipts never contain the object URL/key, download capability, payload,
 credential or credential hash. These cleanup locations remain server-private
 in the recovery record. Normal database backup/access controls must include
 this new table; no new ACL is introduced by this candidate.
+Plans store their namespace in a server-private wrapper, omitted from public
+previews. The preview namespace must match at confirmation. Accepted operations
+retain it across restart/retry. An unbound historical recipe stays pending; it
+is never assigned today's namespace.
 Receipts include server build/commit and `cli_version_reported`; only the
 known candidate CLI header value is retained, otherwise UNKNOWN. This client
 label is not a cryptographic executable or identity attestation. Empty/unknown
@@ -106,11 +112,23 @@ completed requests return their receipt. Confirmation after timeout first
 requires reading the original operation; the CLI does not automatically retry
 POST or downgrade to bare DELETE. There is no background sweep/poller.
 
-Local primary verification uses `lstat` for the object, sidecar and staging
-file. S3-compatible verification uses authenticated `HeadObject`: only 404
-means absent; 200, 403, timeout and other errors do not verify. No object body
-is fetched. Unknown storage backends remain pending. This is a primary-key
-check, not a claim about historical versions, caches, backups or all copies.
+Local deletion holds an operation-owned `os.Root` from binding through deletion,
+verification and close. The private namespace hashes the canonical root path and
+directory device/inode on Darwin/Linux. Replacing the configured path cannot
+redirect an already-bound operation; resumed operations must match the original
+namespace. Root-relative `lstat` checks object, sidecar and staging absence
+without fetching bodies. Unsupported local platforms fail closed.
+
+**Provider limitation:** the S3 HEAD helper alone does not prove a stable original
+namespace. This patch does not invent one from bucket/endpoint strings or add a
+sentinel object, configuration or IAM change. S3 and any backend lacking a trusted
+`DeletionBinder` are rejected at preview before metadata changes; accepted old or
+unbound recipes stay pending. S3 namespace binding is NOT IMPLEMENTED, and its
+adapter/native integration remains NOT RUN. The existing HEAD helper treats only
+404 as absence, but does not enable this management route. Complete S3 support
+needs an explicit provider identity source and tests. This is an engineering gap,
+not a claim that only deployment approval remains. Primary-key verification never
+proves historical versions, caches or backups erased.
 
 Exit codes align with native CLI tiers: 0 successful read/preview or verified
 confirmation; 1 failed/pending/unknown; 2 transport; 3 authentication/permission;
@@ -130,8 +148,10 @@ GO111MODULE=off go test -race -count=1 -v ./server/internal/attachmentadmin
 GO111MODULE=off ADMIN_BINARY=/absolute/path/to/multica-attachment-admin \
   go test -race -count=1 -v ./server/internal/attachmentadmin
 GO111MODULE=off go test -race -count=1 -v \
-  server/internal/storage/local.go server/internal/storage/util.go \
-  server/internal/storage/deletion_verify_test.go
+  server/internal/storage/storage.go server/internal/storage/local.go \
+  server/internal/storage/util.go server/internal/storage/local_deletion.go \
+  server/internal/storage/local_identity_unix.go \
+  server/internal/storage/deletion_verify_test.go server/internal/storage/local_deletion_test.go
 ```
 
 The CLI tests execute the delivered executable against an own short-lived
